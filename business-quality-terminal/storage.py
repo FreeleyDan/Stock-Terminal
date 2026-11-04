@@ -51,13 +51,35 @@ def _empty() -> Dict[str, Any]:
         "portfolio": [], "watchlist": [], "notes": {}, "manual": {},
         "portfolios": {"Main": []}, "watchlists": {"Main": []},
         "portfolio_cash": {"Main": 0.0}, "scan_presets": {"undervalued": {}, "dividend": {}},
-        "signal_log": [],
+        "signal_log": [], "portfolio_account_types": {"Main": "Not set"},
+        "tax_rates": {"lt_pct": 0.0, "st_pct": 0.0, "ca_pct": 0.0}, "sales_log": [],
     }
+
+
+def _parse_date(value: Any) -> Optional[str]:
+    """Normalize a date to YYYY-MM-DD, or None if it is not a real date.
+    Accepts 'YYYY-MM-DD' strings and date/datetime objects."""
+    if value is None or value == "":
+        return None
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+    text = str(value).strip()[:10]
+    try:
+        from datetime import datetime as _dt
+        return _dt.strptime(text, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except Exception:
+        return None
 
 
 def _clean_holding(row: Any) -> Optional[Dict[str, Any]]:
     """One holding: ticker, shares, avg_cost, plus optional target_pct
-    (0-100, % of account) and drip (bool). Missing optionals stay None/False."""
+    (0-100, % of account), drip (bool), and purchase_date (YYYY-MM-DD).
+    Missing optionals stay None/False. Purchase date is a single-lot
+    assumption: if you bought in multiple lots, one date cannot split
+    long-term vs short-term per lot — the UI says so."""
     if not isinstance(row, dict) or not normalize_ticker(row.get("ticker", "")):
         return None
     holding: Dict[str, Any] = {
@@ -69,7 +91,13 @@ def _clean_holding(row: Any) -> Optional[Dict[str, Any]]:
     if target is not None:
         holding["target_pct"] = max(0.0, min(100.0, target))
     holding["drip"] = bool(row.get("drip")) if row.get("drip") is not None else False
+    purchase_date = _parse_date(row.get("purchase_date"))
+    if purchase_date:
+        holding["purchase_date"] = purchase_date
     return holding
+
+
+ACCOUNT_TYPES = ("Taxable", "Roth IRA", "Traditional IRA", "Not set")
 
 
 def _clean_portfolios(raw: Any, legacy: Any) -> Dict[str, List[Dict[str, Any]]]:
@@ -203,10 +231,36 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
                     notes[clean_ticker][k] = int(notes[clean_ticker][k])
                 except (TypeError, ValueError):
                     notes[clean_ticker][k] = ""
+    account_types: Dict[str, str] = {}
+    raw_types = data.get("portfolio_account_types", {}) or {}
+    if isinstance(raw_types, dict):
+        for name, v in raw_types.items():
+            if isinstance(name, str) and name.strip() and v in ACCOUNT_TYPES:
+                account_types[name.strip()] = v
+    for name in portfolios:
+        account_types.setdefault(name, "Not set")
+    raw_rates = data.get("tax_rates", {}) or {}
+    tax_rates = {
+        "lt_pct": _to_float(raw_rates.get("lt_pct")) or 0.0,
+        "st_pct": _to_float(raw_rates.get("st_pct")) or 0.0,
+        "ca_pct": _to_float(raw_rates.get("ca_pct")) or 0.0,
+    }
+    sales: List[Dict[str, Any]] = []
+    for entry in data.get("sales_log", []) or []:
+        if isinstance(entry, dict) and normalize_ticker(entry.get("ticker", "")) and _parse_date(entry.get("date")):
+            sales.append({
+                "date": _parse_date(entry["date"]), "ticker": normalize_ticker(entry["ticker"]),
+                "portfolio": str(entry.get("portfolio", "")) or "",
+                "shares": _to_float(entry.get("shares")), "sale_price": _to_float(entry.get("sale_price")),
+                "avg_cost": _to_float(entry.get("avg_cost")), "gain": _to_float(entry.get("gain")),
+                "term": str(entry.get("term", "")) or "",
+                "purchase_date": _parse_date(entry.get("purchase_date")),
+            })
     return {
         "portfolio": portfolio, "watchlist": list(dict.fromkeys(watchlist)),
         "portfolios": portfolios, "watchlists": watchlists, "portfolio_cash": cash,
         "scan_presets": presets, "signal_log": log,
+        "portfolio_account_types": account_types, "tax_rates": tax_rates, "sales_log": sales,
         "notes": notes, "manual": _clean_manual(data.get("manual", {})),
     }
 
@@ -243,8 +297,11 @@ def delete_portfolio(name: str, path: str = DATA_FILE) -> bool:
     portfolios.pop(name, None)
     cash = dict(data.get("portfolio_cash") or {})
     cash.pop(name, None)
+    types = dict(data.get("portfolio_account_types") or {})
+    types.pop(name, None)
     data["portfolios"] = portfolios
     data["portfolio_cash"] = cash
+    data["portfolio_account_types"] = types
     data["portfolio"] = portfolios.get("Main") or next(iter(portfolios.values()), [])
     return save_user_data(data, path)
 
@@ -275,6 +332,53 @@ def save_cash(portfolio_name: str, cash: float, path: str = DATA_FILE) -> bool:
     cash_map = dict(data.get("portfolio_cash") or {})
     cash_map[portfolio_name] = max(0.0, float(cash) if cash else 0.0)
     data["portfolio_cash"] = cash_map
+    return save_user_data(data, path)
+
+
+def save_account_type(portfolio_name: str, account_type: str, path: str = DATA_FILE) -> bool:
+    if account_type not in ACCOUNT_TYPES:
+        return False
+    data = load_user_data(path)
+    types = dict(data.get("portfolio_account_types") or {})
+    types[portfolio_name] = account_type
+    data["portfolio_account_types"] = types
+    return save_user_data(data, path)
+
+
+def delete_account_type(portfolio_name: str, path: str = DATA_FILE) -> bool:
+    data = load_user_data(path)
+    types = dict(data.get("portfolio_account_types") or {})
+    types.pop(portfolio_name, None)
+    data["portfolio_account_types"] = types
+    return save_user_data(data, path)
+
+
+def save_tax_rates(lt_pct: float, st_pct: float, ca_pct: float, path: str = DATA_FILE) -> bool:
+    data = load_user_data(path)
+    data["tax_rates"] = {
+        "lt_pct": max(0.0, min(100.0, float(lt_pct or 0.0))),
+        "st_pct": max(0.0, min(100.0, float(st_pct or 0.0))),
+        "ca_pct": max(0.0, min(100.0, float(ca_pct or 0.0))),
+    }
+    return save_user_data(data, path)
+
+
+def append_sale(entry: Dict[str, Any], path: str = DATA_FILE) -> bool:
+    """Append one recorded sale. Gain/term should already be computed
+    by the caller; this only validates and stores the entry."""
+    date = _parse_date(entry.get("date"))
+    ticker = normalize_ticker(entry.get("ticker", ""))
+    if not date or not ticker:
+        return False
+    data = load_user_data(path)
+    sales = list(data.get("sales_log") or [])
+    sales.append({
+        "date": date, "ticker": ticker, "portfolio": str(entry.get("portfolio", "")) or "",
+        "shares": _to_float(entry.get("shares")), "sale_price": _to_float(entry.get("sale_price")),
+        "avg_cost": _to_float(entry.get("avg_cost")), "gain": _to_float(entry.get("gain")),
+        "term": str(entry.get("term", "")) or "", "purchase_date": _parse_date(entry.get("purchase_date")),
+    })
+    data["sales_log"] = sales
     return save_user_data(data, path)
 
 
