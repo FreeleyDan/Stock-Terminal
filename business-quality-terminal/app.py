@@ -305,7 +305,7 @@ with st.sidebar:
 
     st.divider()
     discount_rate = st.slider(
-        "Discount rate (minimum acceptable return)", min_value=0.06, max_value=0.20, value=0.10, step=0.01, format="%.2f"
+        "Discount rate (minimum acceptable return)", min_value=0.06, max_value=0.20, value=0.15, step=0.01, format="%.2f"
     )
     max_growth = st.slider(
         "Growth cap for Sticker Price", min_value=0.05, max_value=0.30, value=DEFAULT_MAX_GROWTH_RATE, step=0.01, format="%.2f"
@@ -549,10 +549,36 @@ with tab_watchlist:
 
 
 # --- 4 & 5. Market scanner --------------------------------------------------
-def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat: float, quality_first: bool = True, download_key: str = "scan_csv") -> None:
+def _pct_or_dash(v: Any) -> str:
+    return "\u2014" if v is None else f"{v:.1%}"
+
+
+def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat: float, quality_first: bool = True, download_key: str = "scan_csv", dividend_mode: bool = False, max_payout: Optional[float] = None, min_div_growth: Optional[float] = None, min_chowder: Optional[float] = None) -> None:
+    # Dividend tab only (Miller / Van Knapp layer): filter snapshots
+    # before ranking. A missing metric is shown as "—" and does NOT
+    # exclude a stock — SEC dividend-per-share coverage is imperfect,
+    # so unknown is not treated as failing.
+    snapshots_for_rank = scan["snapshots"]
+    if dividend_mode:
+        filtered = []
+        for snap in snapshots_for_rank:
+            if snap.get("error"):
+                filtered.append(snap)
+                continue
+            payout = snap.get("payout_ratio")
+            if max_payout is not None and payout is not None and payout > max_payout / 100.0:
+                continue
+            dgr = snap.get("dividend_growth_5yr")
+            if min_div_growth is not None and dgr is not None and dgr < min_div_growth / 100.0:
+                continue
+            chow = snap.get("chowder")
+            if min_chowder is not None and chow is not None and chow < min_chowder / 100.0:
+                continue
+            filtered.append(snap)
+        snapshots_for_rank = filtered
     if quality_first:
         stepped = stepped_rank_snapshots(
-            scan["snapshots"], discount_rate, max_growth, min_dividend_years=min_dividend_years, min_moat_score=min_moat, top_n=25
+            snapshots_for_rank, discount_rate, max_growth, min_dividend_years=min_dividend_years, min_moat_score=min_moat, top_n=25
         )
         ranked = stepped["ranked"]
         hurdle_text = (
@@ -564,13 +590,23 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
         )
     else:
         ranked = rank_snapshots(
-            scan["snapshots"], discount_rate, max_growth, min_dividend_years=min_dividend_years, min_moat_score=min_moat, top_n=25
+            snapshots_for_rank, discount_rate, max_growth, min_dividend_years=min_dividend_years, min_moat_score=min_moat, top_n=25
         )
         hurdle_text = "Quality-first off — ranking by price alone (moat filter only)"
     st.caption(
         f"{scan['label']}: scanned {scan['done']} of {scan['total']} tickers \u2014 {len(scan['snapshots'])} had usable "
         f"data, {ranked['valued_count']} could be valued, {ranked['matched_count']} match your filters. {hurdle_text}."
     )
+    if dividend_mode:
+        st.caption(
+            "Dividend tab only — Lowell Miller, The Single Best Investment, plus David Van Knapp, plus your "
+            "10-criteria screener: payout generally under 65% (Miller: under 60% non-utilities), dividend growth "
+            "at least 4% (Miller minimum), Chowder = yield + 5-year dividend growth (Van Knapp / Chowder rule, "
+            "8%+ favored), and 10-by-10 = years for yield-on-cost to reach 10%. Van Knapp's full Quality Snapshots "
+            "score uses paid data (Value Line, Morningstar moat, S&P ratings, Simply Safe Dividends) that SEC filings "
+            "don't carry, so this tab uses the app's Moat Score / Debt Test / free-cash-flow checks as its quality proxy, "
+            "not his exact score. Stocks with a missing dividend metric show \u2014 and are not excluded for it."
+        )
     if scan.get("aborted"):
         st.warning(scan["aborted"])
     if quality_first and stepped["schd_fallback"]:
@@ -585,16 +621,38 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
         rows = []
         for i, r in enumerate(ranked["top_results"], start=1):
             note_scan = _notes_for(r["ticker"])
-            rows.append(
-                {
-                    "#": i, "Ticker": r["ticker"], "Company": r["name"] or "", "Price": money(r["current_price"]),
-                    "Sticker": money(r["sticker_price"]), "MOS Price": money(r["margin_of_safety_price"]),
-                    "% Below Sticker": f"{r['undervalued_pct']:.1f}%", "Growth Used": f"{r['growth_used']:.1%}",
-                    "Moat": r["moat_score"], "Big Five": f"{r.get('big_five_passes', 0)}/5",
-                    "Meaning": note_scan.get("meaning") or "\u2014", "Moat type": note_scan.get("moat_type") or "\u2014",
-                    "Action": r["action"].replace("_", " "), "Div. Streak (yrs)": r["dividend_streak"],
-                }
-            )
+            row: Dict[str, Any] = {
+                "#": i, "Ticker": r["ticker"], "Company": r["name"] or "", "Price": money(r["current_price"]),
+                "Sticker": money(r["sticker_price"]), "MOS Price": money(r["margin_of_safety_price"]),
+                "% Below Sticker": f"{r['undervalued_pct']:.1f}%", "Growth Used": f"{r['growth_used']:.1%}",
+                "Moat": r["moat_score"], "Big Five": f"{r.get('big_five_passes', 0)}/5",
+                "Meaning": note_scan.get("meaning") or "\u2014", "Moat type": note_scan.get("moat_type") or "\u2014",
+                "Action": r["action"].replace("_", " "), "Div. Streak (yrs)": r["dividend_streak"],
+            }
+            if dividend_mode:
+                payout = r.get("payout_ratio")
+                fcf_cover = r.get("fcf_dividend_coverage")
+                if payout is not None and payout > 1.0:
+                    div_flag = "\u26a0 Dividend in jeopardy (payout >100%)"
+                elif fcf_cover is not None and fcf_cover < 1.0:
+                    div_flag = "\u26a0 FCF doesn't cover dividend"
+                elif payout is not None and payout > 0.65:
+                    div_flag = "Payout high"
+                else:
+                    div_flag = "\u2014"
+                years_to_10 = r.get("years_to_10pct_yield_on_cost")
+                row.update(
+                    {
+                        "Yield": _pct_or_dash(r.get("dividend_yield")),
+                        "Div Growth 5yr": _pct_or_dash(r.get("dividend_growth_5yr")),
+                        "Chowder": _pct_or_dash(r.get("chowder")),
+                        "Payout": _pct_or_dash(payout),
+                        "FCF Cover": "\u2014" if fcf_cover is None else f"{fcf_cover:.1f}x",
+                        "Yrs to 10% YoC": "\u2014" if years_to_10 is None else ("Already \u226510%" if years_to_10 == 0 else f"{years_to_10:.0f} yrs"),
+                        "Div. flag": div_flag,
+                    }
+                )
+            rows.append(row)
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
         st.download_button(
             "Download this Top 25 (CSV)",
@@ -673,15 +731,29 @@ with tab_undervalued:
 with tab_dividends:
     st.caption(
         "The same scan as the previous tab (run it there first), keeping only companies that have raised their "
-        "dividend per share for at least this many years in a row."
+        "dividend per share for at least this many years in a row. This tab ONLY adds the dividend-growth layer: "
+        "Lowell Miller, The Single Best Investment, and David Van Knapp's dividend-growth teachings, plus your "
+        "10-criteria screener. The other tabs do not use Miller / Van Knapp."
     )
-    div_years = st.slider("Minimum consecutive years of dividend growth", 1, 25, 5, key="div_years")
+    div_years = st.slider("Minimum consecutive years of dividend growth (5+ required, 10+ preferred in your screener)", 1, 25, 5, key="div_years")
     min_moat_div = st.slider("Minimum Moat Score (filter)", 0, 100, 0, key="div_moat")
+    max_payout_div = st.slider("Maximum payout ratio — DPS / EPS (your screener: generally under 65%; Miller: under 60% non-utilities)", 0, 100, 65, key="div_payout")
+    min_div_growth_div = st.slider("Minimum 5-year dividend growth (Miller minimum: 4%)", 0, 20, 4, key="div_growth")
+    min_chowder_div = st.slider("Minimum Chowder — yield + 5yr dividend growth (8%+ favored; 0 = show all, highlight in table)", 0, 15, 0, key="div_chowder")
     quality_first_div = st.checkbox(
         "Wonderful businesses first (same hurdle step-down as the Undervalued tab)",
         value=True, key="div_quality_first",
     )
     if "scan" in st.session_state:
-        render_ranked_table(st.session_state["scan"], int(div_years), float(min_moat_div), quality_first=quality_first_div, download_key="div_csv")
+        render_ranked_table(
+            st.session_state["scan"], int(div_years), float(min_moat_div), quality_first=quality_first_div,
+            download_key="div_csv", dividend_mode=True, max_payout=float(max_payout_div),
+            min_div_growth=float(min_div_growth_div), min_chowder=float(min_chowder_div),
+        )
+        st.caption(
+            "Note: dividend metrics come from fresh SEC filings. A scan cached before this update won't have them "
+            "(shows \u2014) — click Refresh data on the Ticker Lookup tab, or wait for the 24-hour cache to expire, "
+            "then re-run the scan."
+        )
     else:
         st.info("Run a scan on the Top 25 Undervalued tab first; this tab reuses its results.")

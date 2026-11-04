@@ -128,7 +128,7 @@ def scan_snapshots(
 
 def rank_snapshots(
     snapshots: List[Dict[str, Any]],
-    discount_rate: float = 0.10,
+    discount_rate: float = 0.15,
     max_growth_rate: float = 0.15,
     min_dividend_years: int = 0,
     min_moat_score: float = 0.0,
@@ -171,6 +171,16 @@ def rank_snapshots(
                 "action": val["action"],
                 "dividend_streak": snap.get("dividend_streak", 0),
                 "big_five_passes": passes,
+                # Dividend-growth metrics (dividend tab only; None for
+                # older cached snapshots — the tab shows "—" for those).
+                "dividend_per_share": snap.get("dividend_per_share"),
+                "dividend_yield": snap.get("dividend_yield"),
+                "dividend_growth_5yr": snap.get("dividend_growth_5yr"),
+                "dividend_growth_10yr": snap.get("dividend_growth_10yr"),
+                "payout_ratio": snap.get("payout_ratio"),
+                "chowder": snap.get("chowder"),
+                "years_to_10pct_yield_on_cost": snap.get("years_to_10pct_yield_on_cost"),
+                "fcf_dividend_coverage": snap.get("fcf_dividend_coverage"),
             }
         )
     rows.sort(key=lambda r: r["undervalued_pct"], reverse=True)
@@ -179,7 +189,7 @@ def rank_snapshots(
 
 def stepped_rank_snapshots(
     snapshots: List[Dict[str, Any]],
-    discount_rate: float = 0.10,
+    discount_rate: float = 0.15,
     max_growth_rate: float = 0.15,
     min_dividend_years: int = 0,
     min_moat_score: float = 0.0,

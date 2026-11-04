@@ -85,7 +85,7 @@ def calculate_sticker_price(
     current_eps: float,
     estimated_growth_rate: float,
     historical_pe: float,
-    discount_rate: float = 0.10,
+    discount_rate: float = 0.15,
 ) -> Optional[float]:
     """
     Sticker Price -- Phil Town's "what is this business worth today"
@@ -105,8 +105,8 @@ def calculate_sticker_price(
       3. Future stock value = projected EPS (year 10) * future PE.
       4. Discount that future value back to the present at
          discount_rate (Phil Town's default "minimum acceptable rate of
-         return" is 15%; this function defaults to 10% but callers should
-         pass their own required return).
+         return" is 15%, and the app now defaults to 15% per the user's
+         choice; callers should still pass their own required return).
 
     growth_rate_as_whole_number: estimated_growth_rate is expected as a
     decimal (0.12 for 12%); internally converted to 12 for the 2x-cap

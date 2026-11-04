@@ -15,6 +15,7 @@ The single place every tab gets its numbers from.
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -68,6 +69,96 @@ def consecutive_dividend_growth_years(dividend_series: Dict[str, float]) -> int:
     return streak
 
 
+def _dividend_metrics(
+    dps_series: Dict[str, float],
+    current_eps: Optional[float],
+    current_price: Optional[float],
+    fcf_history: Dict[Any, float],
+    shares_history: Dict[Any, float],
+) -> Dict[str, Any]:
+    """
+    Dividend-growth metrics used ONLY by the dividend tab (Miller /
+    Van Knapp layer). All values are None when the SEC data does not
+    support them — callers must show "—" for None, never 0.
+
+    - dividend_per_share: latest annual DPS from SEC filings.
+    - dividend_yield: latest DPS / current price (trailing yield).
+    - dividend_growth_5yr / _10yr: CAGR of DPS over ~5 / ~10 years,
+      using the filing nearest the target date (within 200 days).
+    - payout_ratio: DPS / EPS (Miller: <60% non-utilities, <70-85%
+      utilities; the user's screener uses <65% generally).
+    - chowder: yield + 5yr dividend growth (Van Knapp / Chowder rule:
+      >=8% is favored as likely to deliver ~8% annualized returns).
+    - years_to_10pct_yield_on_cost: years for yield-on-cost to reach
+      10% at the current 5yr growth rate (Van Knapp "10 by 10").
+    - fcf_dividend_coverage: free cash flow per share / DPS.
+    """
+    out: Dict[str, Any] = {
+        "dividend_per_share": None,
+        "dividend_yield": None,
+        "dividend_growth_5yr": None,
+        "dividend_growth_10yr": None,
+        "payout_ratio": None,
+        "chowder": None,
+        "years_to_10pct_yield_on_cost": None,
+        "fcf_dividend_coverage": None,
+    }
+    if not dps_series:
+        return out
+    dates = sorted(dps_series.keys())
+    latest_date_str = dates[-1]
+    latest_dps = dps_series[latest_date_str]
+    if latest_dps is None or latest_dps <= 0:
+        return out
+    out["dividend_per_share"] = latest_dps
+    latest_days = _days_between("1970-01-01", latest_date_str)
+    if latest_days is None:
+        return out
+
+    def _cagr_years_ago(years: float) -> Optional[float]:
+        target = years * 365.25
+        best = None
+        best_diff = None
+        for d in dates[:-1]:
+            days = _days_between("1970-01-01", d)
+            if days is None:
+                continue
+            elapsed = latest_days - days
+            if elapsed <= 0:
+                continue
+            diff = abs(elapsed - target)
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                best = (d, elapsed)
+        if best is None or best_diff is None or best_diff > 200:
+            return None
+        past = dps_series[best[0]]
+        if past is None or past <= 0:
+            return None
+        actual_years = best[1] / 365.25
+        if actual_years <= 0:
+            return None
+        return (latest_dps / past) ** (1.0 / actual_years) - 1.0
+
+    out["dividend_growth_5yr"] = _cagr_years_ago(5)
+    out["dividend_growth_10yr"] = _cagr_years_ago(10)
+    if current_eps is not None and current_eps > 0:
+        out["payout_ratio"] = latest_dps / current_eps
+    if current_price is not None and current_price > 0:
+        out["dividend_yield"] = latest_dps / current_price
+    if out["dividend_yield"] is not None and out["dividend_growth_5yr"] is not None:
+        out["chowder"] = out["dividend_yield"] + out["dividend_growth_5yr"]
+        if out["dividend_yield"] >= 0.10:
+            out["years_to_10pct_yield_on_cost"] = 0.0
+        elif out["dividend_growth_5yr"] > 0:
+            out["years_to_10pct_yield_on_cost"] = math.log(0.10 / out["dividend_yield"]) / math.log(1.0 + out["dividend_growth_5yr"])
+    fcf0 = (fcf_history or {}).get(0)
+    shares0 = (shares_history or {}).get(0)
+    if fcf0 is not None and shares0:
+        out["fcf_dividend_coverage"] = (fcf0 / shares0) / latest_dps
+    return out
+
+
 def _error(ticker: str, message: str, kind: str) -> Dict[str, Any]:
     return {"ticker": ticker, "error": message, "error_kind": kind}
 
@@ -118,6 +209,13 @@ def _evaluate(ticker: str, prune_unvaluable: bool) -> Tuple[Dict[str, Any], Opti
     except Exception:
         return _error(ticker, "Couldn't compute valuation inputs", PERMANENT), "full"
 
+    div_metrics = _dividend_metrics(
+        hist.get("_dividends_per_share_history") or {},
+        current_eps,
+        bundle["last_close"],
+        hist.get("Free_Cash_Flow") or {},
+        hist.get("_shares_outstanding_history") or {},
+    )
     snapshot = {
         "ticker": ticker,
         "name": raw.get("entityName"),
@@ -137,6 +235,9 @@ def _evaluate(ticker: str, prune_unvaluable: bool) -> Tuple[Dict[str, Any], Opti
         # snapshots — callers must use .get() with a fallback):
         "owner_earnings": (hist.get("_owner_earnings_history") or {}).get(0),
         "shares_history": hist.get("_shares_outstanding_history") or {},
+        # Dividend-growth metrics — dividend tab only (Miller / Van Knapp).
+        # Missing from older cached snapshots; callers must use .get().
+        **div_metrics,
     }
     return snapshot, "full"
 
@@ -192,7 +293,7 @@ def build_snapshot(
 
 def valuation_from_snapshot(
     snapshot: Dict[str, Any],
-    discount_rate: float = 0.10,
+    discount_rate: float = 0.15,
     max_growth_rate: float = DEFAULT_MAX_GROWTH_RATE,
 ) -> Dict[str, Any]:
     """
