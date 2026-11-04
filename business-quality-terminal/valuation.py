@@ -133,6 +133,10 @@ def _evaluate(ticker: str, prune_unvaluable: bool) -> Tuple[Dict[str, Any], Opti
         "gatekeeper": gatekeeper,
         "dividend_streak": streak,
         "split_count": len(bundle["splits"]),
+        # Extra numbers for the ticker card (missing from older cached
+        # snapshots — callers must use .get() with a fallback):
+        "owner_earnings": (hist.get("_owner_earnings_history") or {}).get(0),
+        "shares_history": hist.get("_shares_outstanding_history") or {},
     }
     return snapshot, "full"
 

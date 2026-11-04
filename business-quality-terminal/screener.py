@@ -18,7 +18,31 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional
 
+from gatekeeper import BIG_FIVE_METRICS
 from valuation import TRANSIENT, build_snapshot, valuation_from_snapshot
+
+
+def big_five_pass_count(snapshot: Dict[str, Any], hurdle: float) -> int:
+    """How many of the Big Five pass at `hurdle`, using stored CAGRs.
+
+    For each metric, take the longest horizon with a CAGR (10yr, then
+    5yr, 3yr, 1yr) and count it as a pass if that CAGR is above the
+    hurdle. This reuses the CAGRs already in the snapshot's gatekeeper
+    result, so stepping the hurdle down does not require a refetch.
+    """
+    big_five = (snapshot.get("gatekeeper") or {}).get("big_five") or {}
+    passes = 0
+    for metric in BIG_FIVE_METRICS:
+        horizons = big_five.get(metric) or {}
+        for h in (10, 5, 3, 1):
+            entry = horizons.get(h) or {}
+            cagr = entry.get("cagr")
+            if cagr is None:
+                continue
+            if cagr > hurdle:
+                passes += 1
+            break
+    return passes
 
 SCAN_WORKERS = 4
 SCAN_PRICE_MAX_AGE_SECONDS = 24 * 60 * 60  # a scan uses prices up to a day old
@@ -109,8 +133,17 @@ def rank_snapshots(
     min_dividend_years: int = 0,
     min_moat_score: float = 0.0,
     top_n: int = 25,
+    min_big_five_passes: int = 0,
+    big_five_hurdle: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Most undervalued first, i.e. largest (Sticker - Price) / Sticker."""
+    """Most undervalued first, i.e. largest (Sticker - Price) / Sticker.
+
+    Quality filters (dividend streak, moat, Big Five passes) are applied
+    BEFORE sorting by price, so a cheap weak business cannot outrank a
+    wonderful one on price alone. When `big_five_hurdle` is given, a row
+    must pass at least `min_big_five_passes` of the Big Five at that
+    hurdle; when it is None, no Big Five filter is applied.
+    """
     valued = 0
     rows: List[Dict[str, Any]] = []
     for snap in snapshots:
@@ -121,6 +154,9 @@ def rank_snapshots(
         if snap.get("dividend_streak", 0) < min_dividend_years:
             continue
         if snap.get("moat_score", 0.0) < min_moat_score:
+            continue
+        passes = big_five_pass_count(snap, big_five_hurdle) if big_five_hurdle is not None else big_five_pass_count(snap, 0.10)
+        if big_five_hurdle is not None and passes < min_big_five_passes:
             continue
         rows.append(
             {
@@ -134,7 +170,61 @@ def rank_snapshots(
                 "moat_score": snap.get("moat_score", 0.0),
                 "action": val["action"],
                 "dividend_streak": snap.get("dividend_streak", 0),
+                "big_five_passes": passes,
             }
         )
     rows.sort(key=lambda r: r["undervalued_pct"], reverse=True)
     return {"top_results": rows[:top_n], "matched_count": len(rows), "valued_count": valued}
+
+
+def stepped_rank_snapshots(
+    snapshots: List[Dict[str, Any]],
+    discount_rate: float = 0.10,
+    max_growth_rate: float = 0.15,
+    min_dividend_years: int = 0,
+    min_moat_score: float = 0.0,
+    top_n: int = 25,
+    min_big_five_passes: int = 4,
+    start_hurdle: float = 0.10,
+    floor_hurdle: float = 0.05,
+) -> Dict[str, Any]:
+    """Rank with the Rule #1 hurdle stepped down 1% at a time if empty.
+
+    Starts at `start_hurdle` (10% by default). If no stock passes
+    `min_big_five_passes` of the Big Five at that hurdle (plus the other
+    filters), the hurdle drops exactly 1 percentage point and the ranking
+    is retried, down to `floor_hurdle`. If nothing passes even at the
+    floor, the result carries `schd_fallback=True`: per the user's locked
+    rule, SCHD is the fallback for an empty / disqualified list. SCHD
+    itself is an ETF, not a 10-K filer, so it is never given a fake
+    Sticker Price here — the fallback is a message, not a row.
+    """
+    hurdle = start_hurdle
+    last_ranked: Dict[str, Any] = {"top_results": [], "matched_count": 0, "valued_count": 0}
+    while hurdle >= floor_hurdle - 1e-9:
+        hurdle = round(hurdle, 2)
+        ranked = rank_snapshots(
+            snapshots,
+            discount_rate,
+            max_growth_rate,
+            min_dividend_years,
+            min_moat_score,
+            top_n,
+            min_big_five_passes=min_big_five_passes,
+            big_five_hurdle=hurdle,
+        )
+        last_ranked = ranked
+        if ranked["matched_count"] > 0:
+            return {
+                "ranked": ranked,
+                "hurdle_used": hurdle,
+                "stepped_down": hurdle < start_hurdle,
+                "schd_fallback": False,
+            }
+        hurdle -= 0.01
+    return {
+        "ranked": last_ranked,
+        "hurdle_used": None,
+        "stepped_down": True,
+        "schd_fallback": True,
+    }

@@ -5,7 +5,8 @@ Business Quality Terminal -- Rule #1 Investing / Buffett-style valuation.
 
 Tabs:
   1. Ticker Lookup        any SEC-registered company, full Gatekeeper checklist
-  2. Portfolio            holdings you track, with SELL / REVIEW / HOLD signals
+  2. Portfolio            holdings you track, with BUY / NEAR BUY / HOLD /
+                          REVIEW / SELL signals (BUY = add to a holding)
   3. Watchlist            tickers you're waiting on, with BUY / NEAR BUY signals
   4. Top 25 Undervalued   market scan (S&P 500, every NYSE+Nasdaq stock, or custom)
   5. Top 25 + Dividend Growers   same scan, filtered by consecutive years of
@@ -16,7 +17,9 @@ Run with:  streamlit run app.py
 
 from __future__ import annotations
 
+import json
 from collections import Counter
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -24,9 +27,18 @@ import streamlit as st
 
 from data_fetcher import clear_cache, normalize_ticker
 from gatekeeper import BIG_FIVE_METRICS, HORIZONS
-from screener import rank_snapshots, scan_snapshots
-from signals import BUY_RANK, SELL_RANK, buy_signal, sell_signal
-from storage import load_user_data, save_portfolio, save_watchlist
+from screener import rank_snapshots, scan_snapshots, stepped_rank_snapshots
+from signals import BUY_RANK, PORTFOLIO_RANK, buy_signal, portfolio_signal, sell_signal
+from storage import (
+    load_last_scan,
+    load_user_data,
+    parse_imported_data,
+    save_last_scan,
+    save_note,
+    save_portfolio,
+    save_user_data,
+    save_watchlist,
+)
 from universe import get_all_us_listed_tickers, get_sp500_tickers
 from valuation import DEFAULT_MAX_GROWTH_RATE, build_snapshot, valuation_from_snapshot
 
@@ -66,7 +78,18 @@ SIGNAL_COLORS = {
     "CHEAP, WEAK MOAT": "#b98600",
     "SELL": "#c62828",
     "REVIEW": "#b98600",
+    "HOLD": "#2e7d32",
 }
+
+MOAT_TYPE_OPTIONS = [
+    "Not rated yet",
+    "Brand",
+    "Switching costs",
+    "Network effect",
+    "Low-cost advantage",
+    "Regulatory / patent",
+    "None / unclear",
+]
 
 LOOKUP_PRICE_MAX_AGE = 60 * 60
 TRACKING_PRICE_MAX_AGE = 15 * 60  # portfolio / watchlist: fresher prices
@@ -125,13 +148,52 @@ def price_color_class(price, sticker, mos) -> str:
     return "metric-red"
 
 
+def _longest_cagr(gatekeeper: Dict[str, Any], metric: str) -> Optional[float]:
+    """Longest-horizon CAGR for a Big Five metric, or None."""
+    horizons = (gatekeeper.get("big_five") or {}).get(metric) or {}
+    for h in (10, 5, 3, 1):
+        entry = horizons.get(h) or {}
+        if entry.get("cagr") is not None:
+            return entry["cagr"]
+    return None
+
+
+def _share_change_pct(shares_history: Dict[Any, Any], years_ago: int) -> Optional[float]:
+    """% change in shares outstanding from `years_ago` to now.
+
+    Positive = dilution (more shares), negative = buybacks (fewer shares).
+    Keys may be ints (from a fresh snapshot) or strings (from a reload).
+    """
+    if not shares_history:
+        return None
+    def _get(years: int) -> Optional[float]:
+        for key in (years, str(years)):
+            if key in shares_history and shares_history[key]:
+                return float(shares_history[key])
+        return None
+    now, past = _get(0), _get(years_ago)
+    if now is None or past is None or past == 0:
+        return None
+    return (now / past - 1.0) * 100.0
+
+
+def _notes_for(ticker: str) -> Dict[str, Any]:
+    try:
+        return (load_user_data().get("notes") or {}).get(normalize_ticker(ticker), {}) or {}
+    except Exception:
+        return {}
+
+
 def build_checklist_dataframe(gatekeeper: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     for metric in BIG_FIVE_METRICS:
         row = {"Metric": METRIC_DISPLAY_NAMES.get(metric, metric)}
         for h in HORIZONS:
             entry = gatekeeper["big_five"].get(metric, {}).get(h, {"status": "not_yet_determined"})
-            row[f"{h}yr"] = status_icon(entry["status"])
+            cagr = entry.get("cagr")
+            # Numbers, not just checkmarks: "12.4% ✅" tells you how close
+            # a pass or fail actually is.
+            row[f"{h}yr"] = f"{cagr:.1%} {status_icon(entry['status'])}" if cagr is not None else status_icon(entry["status"])
         rows.append(row)
     for label, key in (
         ("Debt Test (LT Debt / Owner Earnings \u2264 3)", "debt_test"),
@@ -187,6 +249,47 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
     if val["note"]:
         st.caption(val["note"])
     st.dataframe(build_checklist_dataframe(snap["gatekeeper"]), hide_index=True, use_container_width=True)
+
+    # Numbers behind the checklist: debt, owner earnings, dilution,
+    # and EPS-vs-FCF divergence (cash vs accounting — a Buffett check).
+    gk = snap["gatekeeper"]
+    with st.expander("Numbers behind the checklist", expanded=False):
+        debt_ratio = (gk.get("debt_test") or {}).get("ratio")
+        cap_ratio = (gk.get("capital_allocation_test") or {}).get("ratio")
+        st.write(f"Debt Test: LT debt / owner earnings = {debt_ratio:.2f}x" if debt_ratio is not None else "Debt Test: \u2014 (needs owner earnings)")
+        st.write(f"Capital allocation: Cap-Ex / net income = {cap_ratio:.1%}" if cap_ratio is not None else "Capital allocation: \u2014")
+        st.write(f"Owner earnings (latest year): {money(snap.get('owner_earnings'))}")
+        ch10 = _share_change_pct(snap.get("shares_history") or {}, 10)
+        ch5 = _share_change_pct(snap.get("shares_history") or {}, 5)
+        if ch10 is not None:
+            st.write(f"Shares outstanding: {ch10:+.1f}% over 10 yrs" + (" (dilution)" if ch10 > 0 else " (buybacks)"))
+        if ch5 is not None:
+            st.write(f"Shares outstanding: {ch5:+.1f}% over 5 yrs" + (" (dilution)" if ch5 > 0 else " (buybacks)"))
+        if ch10 is None and ch5 is None:
+            st.write("Shares outstanding trend: \u2014 (not in SEC history)")
+        eps_cagr, fcf_cagr = _longest_cagr(gk, "EPS"), _longest_cagr(gk, "Free_Cash_Flow")
+        if eps_cagr is not None and fcf_cagr is not None:
+            gap_pp = (eps_cagr - fcf_cagr) * 100.0
+            st.write(f"EPS CAGR {eps_cagr:.1%} vs free-cash-flow CAGR {fcf_cagr:.1%} (gap {gap_pp:+.1f} pp)")
+            if gap_pp > 5.0:
+                st.warning("EPS is growing much faster than free cash flow — check earnings quality before trusting the EPS growth rate.")
+        else:
+            st.write("EPS vs free-cash-flow comparison: \u2014")
+
+    # Buffett notes: Meaning / circle of competence, moat type,
+    # Management, thesis, and sell trigger. XBRL cannot see these.
+    note = _notes_for(ticker)
+    with st.expander(f"Buffett notes for {ticker}", expanded=False):
+        meaning = st.slider("Meaning — how well do you understand this business? (1 = not at all, 5 = deeply)", 1, 5, int(note.get("meaning") or 3), key=f"notes_meaning_{ticker}")
+        management = st.slider("Management — trust in capital allocation (1 = low, 5 = high)", 1, 5, int(note.get("management") or 3), key=f"notes_mgmt_{ticker}")
+        moat_type = st.selectbox("Moat type", MOAT_TYPE_OPTIONS, index=MOAT_TYPE_OPTIONS.index(note.get("moat_type")) if note.get("moat_type") in MOAT_TYPE_OPTIONS else 0, key=f"notes_moat_{ticker}")
+        thesis = st.text_area("Thesis — why own this?", value=note.get("thesis") or "", key=f"notes_thesis_{ticker}", height=80)
+        sell_trigger = st.text_area("Sell trigger — what would make you sell?", value=note.get("sell_trigger") or "", key=f"notes_sell_{ticker}", height=80)
+        if st.button("Save notes", key=f"notes_save_{ticker}"):
+            if save_note(ticker, {"meaning": meaning, "management": management, "moat_type": moat_type, "thesis": thesis, "sell_trigger": sell_trigger}):
+                st.success(f"Notes saved for {ticker}.")
+            else:
+                st.warning("Couldn't save notes — they won't persist after a restart on Cloud. Use the Portfolio export as a backup.")
     st.divider()
 
 
@@ -261,7 +364,9 @@ def clean_portfolio_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
 with tab_portfolio:
     st.caption(
         "Add your holdings (shares and average cost are optional but give you gain/loss). "
-        "Changes save automatically to user_data.json. " + DISCLAIMER
+        "Signals are BUY (add to a holding) / NEAR BUY / HOLD / REVIEW / SELL. "
+        "Changes save automatically to user_data.json — on Streamlit Cloud that file "
+        "can be wiped on sleep/restart, so use the export below for anything you want to keep. " + DISCLAIMER
     )
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -270,6 +375,32 @@ with tab_portfolio:
         min_moat_hold = st.slider("Flag when Moat Score is below", 0, 100, 40, key="pf_moat")
     with c3:
         max_loss_pct = st.number_input("Flag when down more than X% vs cost (0 = off)", 0, 90, 0, key="pf_loss")
+    c4, c5 = st.columns(2)
+    with c4:
+        min_moat_buy_pf = st.slider("Minimum Moat Score to call it a BUY (add)", 0, 100, 60, key="pf_buy_moat")
+    with c5:
+        near_buy_pct_pf = st.slider("'Near buy' band: within X% above the buy price", 0, 50, 15, key="pf_near")
+
+    with st.expander("Import a portfolio file (JSON)", expanded=False):
+        st.caption("Import replaces the saved portfolio, watchlist, and notes with the file's contents. Export first if you want a backup.")
+        uploaded_pf = st.file_uploader("Portfolio JSON file", type=["json"], key="pf_import_file")
+        if uploaded_pf is not None and st.button("Import this file", key="pf_import_btn"):
+            try:
+                imported_portfolio, imported_watchlist, imported_notes = parse_imported_data(json.load(uploaded_pf))
+                save_user_data({"portfolio": imported_portfolio, "watchlist": imported_watchlist, "notes": imported_notes})
+                frame_imported = pd.DataFrame(
+                    [{"Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": h["avg_cost"]} for h in imported_portfolio],
+                    columns=["Ticker", "Shares", "Avg Cost"],
+                )
+                frame_imported["Shares"] = pd.to_numeric(frame_imported["Shares"], errors="coerce").astype("float64")
+                frame_imported["Avg Cost"] = pd.to_numeric(frame_imported["Avg Cost"], errors="coerce").astype("float64")
+                st.session_state["portfolio_df"] = frame_imported
+                st.session_state["portfolio_saved"] = imported_portfolio
+                st.session_state.pop("watchlist_df", None)
+                st.session_state.pop("watchlist_saved", None)
+                st.success(f"Imported {len(imported_portfolio)} holdings and {len(imported_watchlist)} watchlist tickers.")
+            except Exception as e:
+                st.error(f"Import failed: {e}")
 
     if "portfolio_df" not in st.session_state:
         saved = load_user_data()
@@ -302,7 +433,7 @@ with tab_portfolio:
             st.warning("Couldn't write user_data.json \u2014 changes won't persist after a restart.")
 
     if not holdings:
-        st.info("Add a ticker above to see its sell signal.")
+        st.info("Add a ticker above to see its buy/hold/sell signal.")
     else:
         rows, total_value, total_cost = [], 0.0, 0.0
         with st.spinner("Checking your holdings..."):
@@ -311,10 +442,15 @@ with tab_portfolio:
                 if snap.get("error"):
                     rows.append({"Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": money(h["avg_cost"]), "Price": "\u2014",
                                  "Value": "\u2014", "Gain/Loss": "\u2014", "Gain %": "\u2014", "Sticker": "\u2014", "Moat": "\u2014",
+                                 "Meaning": "\u2014", "Moat type": "\u2014",
                                  "Signal": "NO DATA", "Why": snap["error"], "_rank": 9})
                     continue
                 val = valuation_from_snapshot(snap, discount_rate, max_growth)
-                sig = sell_signal(snap, val, h["avg_cost"], approach_pct, min_moat_hold, float(max_loss_pct))
+                sig = portfolio_signal(
+                    snap, val, h["avg_cost"], approach_pct, min_moat_hold, float(max_loss_pct),
+                    min_moat_buy_pf, float(near_buy_pct_pf),
+                )
+                note_pf = _notes_for(h["ticker"])
                 price = snap["current_price"]
                 value = price * h["shares"] if h["shares"] else None
                 gain = (price - h["avg_cost"]) * h["shares"] if (h["shares"] and h["avg_cost"]) else None
@@ -328,7 +464,8 @@ with tab_portfolio:
                     "Value": money(value), "Gain/Loss": money(gain),
                     "Gain %": "\u2014" if gain_pct is None else f"{gain_pct:+.1f}%",
                     "Sticker": money(val["sticker_price"]), "Moat": snap["moat_score"],
-                    "Signal": sig["signal"], "Why": "; ".join(sig["reasons"]), "_rank": SELL_RANK.get(sig["signal"], 9),
+                    "Meaning": note_pf.get("meaning") or "\u2014", "Moat type": note_pf.get("moat_type") or "\u2014",
+                    "Signal": sig["signal"], "Why": "; ".join(sig["reasons"]), "_rank": PORTFOLIO_RANK.get(sig["signal"], 9),
                 })
         rows.sort(key=lambda r: r["_rank"])
         df = pd.DataFrame(rows).drop(columns=["_rank"])
@@ -337,6 +474,16 @@ with tab_portfolio:
             st.markdown(f"**Positions with shares and cost:** value of all positions {money(total_value)} \u00b7 cost basis {money(total_cost)}")
         counts = Counter(r["Signal"] for r in rows)
         st.caption(" \u00b7 ".join(f"{n} {s}" for s, n in counts.most_common()))
+        export_data = load_user_data()
+        export_data["portfolio"] = holdings
+        st.download_button(
+            "Download portfolio + notes (JSON)",
+            data=json.dumps(export_data, indent=2),
+            file_name="portfolio.json",
+            mime="application/json",
+            key="pf_export_btn",
+        )
+        st.caption("Keep this file as your backup — on Streamlit Cloud the saved file can be wiped on sleep/restart, and this download is how you restore it (Import above).")
 
 
 # --- 3. Watchlist ---------------------------------------------------------
@@ -402,29 +549,60 @@ with tab_watchlist:
 
 
 # --- 4 & 5. Market scanner --------------------------------------------------
-def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat: float) -> None:
-    ranked = rank_snapshots(
-        scan["snapshots"], discount_rate, max_growth, min_dividend_years=min_dividend_years, min_moat_score=min_moat, top_n=25
-    )
+def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat: float, quality_first: bool = True, download_key: str = "scan_csv") -> None:
+    if quality_first:
+        stepped = stepped_rank_snapshots(
+            scan["snapshots"], discount_rate, max_growth, min_dividend_years=min_dividend_years, min_moat_score=min_moat, top_n=25
+        )
+        ranked = stepped["ranked"]
+        hurdle_text = (
+            f"Big Five hurdle used: {stepped['hurdle_used']:.0%} (stepped down from 10% in 1% steps)"
+            if stepped["stepped_down"] and stepped["hurdle_used"] is not None
+            else f"Big Five hurdle used: {stepped['hurdle_used']:.0%} — wonderful businesses first, then price"
+            if stepped["hurdle_used"] is not None
+            else "No stock passed 4 of 5 Big Five even at 5%"
+        )
+    else:
+        ranked = rank_snapshots(
+            scan["snapshots"], discount_rate, max_growth, min_dividend_years=min_dividend_years, min_moat_score=min_moat, top_n=25
+        )
+        hurdle_text = "Quality-first off — ranking by price alone (moat filter only)"
     st.caption(
         f"{scan['label']}: scanned {scan['done']} of {scan['total']} tickers \u2014 {len(scan['snapshots'])} had usable "
-        f"data, {ranked['valued_count']} could be valued, {ranked['matched_count']} match your filters."
+        f"data, {ranked['valued_count']} could be valued, {ranked['matched_count']} match your filters. {hurdle_text}."
     )
     if scan.get("aborted"):
         st.warning(scan["aborted"])
+    if quality_first and stepped["schd_fallback"]:
+        st.info(
+            "No candidates passed 4 of 5 Big Five at 10% down to 5% — per your locked rule, "
+            "SCHD is the fallback for an empty / disqualified list. SCHD is an ETF, not a "
+            "10-K filer, so it has no Sticker Price here; this is a fallback message, not a valuation."
+        )
     if not ranked["top_results"]:
         st.info("Nothing matched. Loosen the filters, or run a wider scan.")
     else:
-        rows = [
-            {
-                "#": i, "Ticker": r["ticker"], "Company": r["name"] or "", "Price": money(r["current_price"]),
-                "Sticker": money(r["sticker_price"]), "MOS Price": money(r["margin_of_safety_price"]),
-                "% Below Sticker": f"{r['undervalued_pct']:.1f}%", "Growth Used": f"{r['growth_used']:.1%}",
-                "Moat": r["moat_score"], "Action": r["action"].replace("_", " "), "Div. Streak (yrs)": r["dividend_streak"],
-            }
-            for i, r in enumerate(ranked["top_results"], start=1)
-        ]
+        rows = []
+        for i, r in enumerate(ranked["top_results"], start=1):
+            note_scan = _notes_for(r["ticker"])
+            rows.append(
+                {
+                    "#": i, "Ticker": r["ticker"], "Company": r["name"] or "", "Price": money(r["current_price"]),
+                    "Sticker": money(r["sticker_price"]), "MOS Price": money(r["margin_of_safety_price"]),
+                    "% Below Sticker": f"{r['undervalued_pct']:.1f}%", "Growth Used": f"{r['growth_used']:.1%}",
+                    "Moat": r["moat_score"], "Big Five": f"{r.get('big_five_passes', 0)}/5",
+                    "Meaning": note_scan.get("meaning") or "\u2014", "Moat type": note_scan.get("moat_type") or "\u2014",
+                    "Action": r["action"].replace("_", " "), "Div. Streak (yrs)": r["dividend_streak"],
+                }
+            )
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.download_button(
+            "Download this Top 25 (CSV)",
+            data=pd.DataFrame(rows).to_csv(index=False),
+            file_name="top25.csv",
+            mime="text/csv",
+            key=download_key,
+        )
     if scan["errors"]:
         reasons = Counter(scan["errors"].values())
         with st.expander(f"{len(scan['errors'])} tickers skipped \u2014 why"):
@@ -435,9 +613,17 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
 
 with tab_undervalued:
     st.caption(
-        "Scans a universe and ranks by how far each stock trades below its Sticker Price. Results are cached, "
-        "so you can stop a scan and click Scan again to resume. " + DISCLAIMER
+        "Scans a universe and ranks wonderful businesses first, then by how far each stock trades below its "
+        "Sticker Price. Results are cached, so you can stop a scan and click Scan again to resume. " + DISCLAIMER
     )
+    # Restore the last saved scan on a fresh session (Cloud may still wipe
+    # the file on sleep/restart — the CSV download below is the durable copy).
+    if "scan" not in st.session_state:
+        last_scan, last_saved_at = load_last_scan()
+        if last_scan is not None:
+            st.session_state["scan"] = last_scan
+            if last_saved_at:
+                st.caption(f"Loaded last saved scan from {datetime.fromtimestamp(last_saved_at).strftime('%Y-%m-%d %H:%M')}. Click Scan to refresh it.")
     choice = st.radio("Universe", ["S&P 500", "All NYSE + Nasdaq stocks", "Custom list"], horizontal=True, key="scan_universe_choice")
     custom_text = ""
     if choice == "Custom list":
@@ -472,10 +658,15 @@ with tab_undervalued:
             status.empty()
             result["label"] = choice
             st.session_state["scan"] = result
+            save_last_scan(result)
 
+    quality_first_scan = st.checkbox(
+        "Wonderful businesses first: require 4 of 5 Big Five at the hurdle, stepping down 1% from 10% to 5% if empty, SCHD fallback if still empty",
+        value=True, key="scan_quality_first",
+    )
     min_moat_scan = st.slider("Minimum Moat Score (filter)", 0, 100, 0, key="scan_moat")
     if "scan" in st.session_state:
-        render_ranked_table(st.session_state["scan"], 0, float(min_moat_scan))
+        render_ranked_table(st.session_state["scan"], 0, float(min_moat_scan), quality_first=quality_first_scan, download_key="scan_csv")
     else:
         st.info("Pick a universe and click Scan.")
 
@@ -486,7 +677,11 @@ with tab_dividends:
     )
     div_years = st.slider("Minimum consecutive years of dividend growth", 1, 25, 5, key="div_years")
     min_moat_div = st.slider("Minimum Moat Score (filter)", 0, 100, 0, key="div_moat")
+    quality_first_div = st.checkbox(
+        "Wonderful businesses first (same hurdle step-down as the Undervalued tab)",
+        value=True, key="div_quality_first",
+    )
     if "scan" in st.session_state:
-        render_ranked_table(st.session_state["scan"], int(div_years), float(min_moat_div))
+        render_ranked_table(st.session_state["scan"], int(div_years), float(min_moat_div), quality_first=quality_first_div, download_key="div_csv")
     else:
         st.info("Run a scan on the Top 25 Undervalued tab first; this tab reuses its results.")
