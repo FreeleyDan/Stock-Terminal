@@ -231,9 +231,15 @@ tab_lookup, tab_portfolio, tab_watchlist, tab_undervalued, tab_dividends = st.ta
 # --- 1. Ticker Lookup ----------------------------------------------------
 with tab_lookup:
     st.caption("Works for any company that files 10-Ks with the SEC \u2014 not limited to the S&P 500.")
-    if not lookup_tickers:
-        st.info("Enter one or more tickers in the sidebar to begin.")
-    for ticker in lookup_tickers:
+    # Lazy fetch: the page must render before any SEC/Yahoo call runs.
+    # Auto-fetching on first load is what left Cloud stuck on a spinner
+    # when Yahoo throttled / timed out from a shared Cloud IP.
+    if st.button("Fetch tickers", key="fetch_lookup"):
+        st.session_state["lookup_requested"] = lookup_tickers
+    lookup_to_fetch = st.session_state.get("lookup_requested", [])
+    if not lookup_to_fetch:
+        st.info("Enter one or more tickers in the sidebar, then click Fetch tickers.")
+    for ticker in lookup_to_fetch:
         with st.spinner(f"Fetching {ticker}..."):
             snap = build_snapshot(ticker, price_max_age=LOOKUP_PRICE_MAX_AGE)
         val = None if snap.get("error") else valuation_from_snapshot(snap, discount_rate, max_growth)
