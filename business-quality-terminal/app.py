@@ -17,6 +17,7 @@ Run with:  streamlit run app.py
 
 from __future__ import annotations
 
+import io
 import json
 import math
 from collections import Counter
@@ -33,14 +34,20 @@ from screener import big_five_pass_count, dividend_safety_score, rank_snapshots,
 from signals import BUY_RANK, PORTFOLIO_RANK, buy_signal, portfolio_signal, sell_signal
 from storage import (
     MANUAL_SECTOR_OPTIONS,
+    append_signal_log,
     clear_manual,
+    delete_portfolio,
+    delete_scan_preset,
+    delete_watchlist,
     load_last_scan,
     load_user_data,
-    parse_imported_data,
+    parse_imported_full,
+    save_cash,
     save_last_scan,
     save_manual,
     save_note,
     save_portfolio,
+    save_scan_preset,
     save_user_data,
     save_watchlist,
 )
@@ -348,6 +355,64 @@ def _format_market_cap(value: Optional[float]) -> str:
     return money(value)
 
 
+def _owner_earnings_yield(snap: Dict[str, Any]) -> Optional[float]:
+    """Owner earnings (latest year, company total from SEC filings) /
+    market cap. A Buffett-style earnings yield, comparable across
+    holdings. None if either side is missing."""
+    oe = snap.get("owner_earnings")
+    cap = _market_cap(snap)
+    if oe is None or cap is None or cap <= 0:
+        return None
+    try:
+        return float(oe) / float(cap)
+    except (TypeError, ValueError):
+        return None
+
+
+def _short_why(text: str, limit: int = 100) -> str:
+    """Table cells must stay short — long Why text runs off the page
+    and cannot be scrolled to on some clients. The full reasons live in
+    the 'Why, in full' expander under each table."""
+    if not text:
+        return "\u2014"
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "\u2026"
+
+
+def _project_drip_income(div_income: float, dps: float, dgr: float, price: float, shares: float, years: int) -> float:
+    """DRIP projection, flat-price assumption (stated in the UI): each
+    year the dividend is paid on current shares at that year's DPS
+    (DPS grown at dgr), then reinvested at today's price, increasing
+    shares for the next year. Returns that year's income."""
+    shares_sim, dps_sim, income = shares, dps, div_income
+    for _ in range(years):
+        dps_sim *= (1.0 + dgr)
+        income = shares_sim * dps_sim
+        if price and price > 0:
+            shares_sim += income / price
+    return income
+
+
+def _table_downloads(df: pd.DataFrame, key_prefix: str, filename_base: str) -> None:
+    """CSV always; Excel when openpyxl is installed (it is added to
+    requirements.txt, so Cloud gets it on redeploy — if it is missing
+    locally, only CSV is offered rather than an error)."""
+    st.download_button(
+        "Download CSV", data=df.to_csv(index=False), file_name=f"{filename_base}.csv",
+        mime="text/csv", key=f"{key_prefix}_csv",
+    )
+    try:
+        buf = io.BytesIO()
+        df.to_excel(buf, index=False)
+        st.download_button(
+            "Download Excel (.xlsx)", data=buf.getvalue(),
+            file_name=f"{filename_base}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_xlsx",
+        )
+    except Exception:
+        st.caption("Excel export needs openpyxl (added to requirements.txt) — CSV is available now.")
+
+
 def _prices_as_of_caption(dates: List[Any]) -> str:
     """One-line prices-as-of note from snapshot price_dates. A cached
     scan or a tracking-price refresh can leave prices a day (or more)
@@ -450,6 +515,9 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
     if peg_card is not None:
         details.append(f"PEG {peg_card:.2f} (current P/E ÷ EPS growth)")
     details.append(f"Market cap ~{_format_market_cap(_market_cap(snap))}")
+    oey_card = _owner_earnings_yield(snap)
+    if oey_card is not None:
+        details.append(f"Owner earnings yield {oey_card:.1%} (owner earnings ÷ market cap)")
     if snap.get("dividend_streak"):
         details.append(f"dividend raised {snap['dividend_streak']} yrs in a row")
     st.caption(" \u00b7 ".join(details))
@@ -600,7 +668,13 @@ def clean_portfolio_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
         if not ticker or ticker in seen:
             continue
         seen.add(ticker)
-        rows.append({"ticker": ticker, "shares": _num(r.get("Shares")), "avg_cost": _num(r.get("Avg Cost"))})
+        target = _num(r.get("Target %"))
+        drip_raw = r.get("DRIP")
+        rows.append({
+            "ticker": ticker, "shares": _num(r.get("Shares")), "avg_cost": _num(r.get("Avg Cost")),
+            "target_pct": max(0.0, min(100.0, target)) if target is not None else None,
+            "drip": bool(drip_raw) if drip_raw is not None and str(drip_raw) not in ("", "nan") else False,
+        })
     return rows
 
 
@@ -624,55 +698,96 @@ with tab_portfolio:
     with c5:
         near_buy_pct_pf = st.slider("'Near buy' band: within X% above the buy price", 0, 50, 15, key="pf_near")
 
+    # Named portfolios: each name is its own holdings list (e.g. Roth
+    # vs taxable). Legacy single-portfolio files migrate to "Main".
+    saved_all = load_user_data()
+    portfolio_names = list((saved_all.get("portfolios") or {"Main": []}).keys()) or ["Main"]
+    if "pf_selected_name" not in st.session_state or st.session_state["pf_selected_name"] not in portfolio_names:
+        st.session_state["pf_selected_name"] = portfolio_names[0]
+    pf_name = st.selectbox("Portfolio", portfolio_names, key="pf_selected_name")
+    new_pf_col1, new_pf_col2, new_pf_col3 = st.columns(3)
+    with new_pf_col1:
+        new_pf_name = st.text_input("New portfolio name", key="pf_new_name").strip()
+    with new_pf_col2:
+        if st.button("Add portfolio", key="pf_add_btn") and new_pf_name:
+            if new_pf_name in portfolio_names:
+                st.warning(f"A portfolio named {new_pf_name} already exists.")
+            elif save_portfolio([], name=new_pf_name):
+                st.session_state["pf_selected_name"] = new_pf_name
+                st.rerun()
+    with new_pf_col3:
+        if len(portfolio_names) > 1 and st.button(f"Delete portfolio '{pf_name}'", key="pf_del_btn"):
+            st.warning("Deleting cannot be undone — export first if you want a backup.")
+            if delete_portfolio(pf_name):
+                st.session_state["pf_selected_name"] = portfolio_names[0]
+                for k in list(st.session_state.keys()):
+                    if k.startswith("portfolio_df_") or k.startswith("portfolio_saved_"):
+                        st.session_state.pop(k, None)
+                st.rerun()
+    cash_balance = st.number_input(
+        "Cash balance ($) — counts toward total account value and weights",
+        0.0, 1e12, float((saved_all.get("portfolio_cash") or {}).get(pf_name, 0.0)), key=f"pf_cash_{pf_name}",
+    )
+    if cash_balance != float((saved_all.get("portfolio_cash") or {}).get(pf_name, 0.0)):
+        save_cash(pf_name, cash_balance)
+
     with st.expander("Import a portfolio file (JSON)", expanded=False):
-        st.caption("Import replaces the saved portfolio, watchlist, and notes with the file's contents. Export first if you want a backup. Manual dividend data is replaced only if the file contains it — otherwise your existing manual data is kept.")
+        st.caption("Import replaces ALL saved portfolios, watchlists, and notes with the file's contents. Export first if you want a backup. Manual dividend data is replaced only if the file contains it — otherwise your existing manual data is kept.")
         uploaded_pf = st.file_uploader("Portfolio JSON file", type=["json"], key="pf_import_file")
         if uploaded_pf is not None and st.button("Import this file", key="pf_import_btn"):
             try:
-                imported_portfolio, imported_watchlist, imported_notes, imported_manual = parse_imported_data(json.load(uploaded_pf))
-                existing_manual = (load_user_data().get("manual") or {}) if not imported_manual else imported_manual
-                save_user_data({"portfolio": imported_portfolio, "watchlist": imported_watchlist, "notes": imported_notes, "manual": existing_manual})
-                frame_imported = pd.DataFrame(
-                    [{"Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": h["avg_cost"]} for h in imported_portfolio],
-                    columns=["Ticker", "Shares", "Avg Cost"],
-                )
-                frame_imported["Shares"] = pd.to_numeric(frame_imported["Shares"], errors="coerce").astype("float64")
-                frame_imported["Avg Cost"] = pd.to_numeric(frame_imported["Avg Cost"], errors="coerce").astype("float64")
-                st.session_state["portfolio_df"] = frame_imported
-                st.session_state["portfolio_saved"] = imported_portfolio
-                st.session_state.pop("watchlist_df", None)
-                st.session_state.pop("watchlist_saved", None)
-                st.success(f"Imported {len(imported_portfolio)} holdings and {len(imported_watchlist)} watchlist tickers.")
+                imported_full = parse_imported_full(json.load(uploaded_pf))
+                existing_manual = (load_user_data().get("manual") or {}) if not imported_full["manual"] else imported_full["manual"]
+                full_data = load_user_data()
+                full_data["portfolios"] = imported_full["portfolios"]
+                full_data["watchlists"] = imported_full["watchlists"]
+                full_data["portfolio_cash"] = imported_full["portfolio_cash"]
+                full_data["notes"] = imported_full["notes"]
+                full_data["manual"] = existing_manual
+                save_user_data(full_data)
+                first_pf = next(iter(imported_full["portfolios"].keys()), "Main")
+                st.session_state["pf_selected_name"] = first_pf
+                for k in list(st.session_state.keys()):
+                    if k.startswith("portfolio_df_") or k.startswith("portfolio_saved_") or k.startswith("watchlist_df_") or k.startswith("watchlist_saved_"):
+                        st.session_state.pop(k, None)
+                st.success(f"Imported {len(imported_full['portfolios'])} portfolio(s) and {len(imported_full['watchlists'])} watchlist(s).")
+                st.rerun()
             except Exception as e:
                 st.error(f"Import failed: {e}")
 
-    if "portfolio_df" not in st.session_state:
-        saved = load_user_data()
+    pf_df_key = f"portfolio_df_{pf_name}"
+    pf_saved_key = f"portfolio_saved_{pf_name}"
+    if pf_df_key not in st.session_state:
+        saved_pf = (load_user_data().get("portfolios") or {}).get(pf_name, [])
         frame = pd.DataFrame(
-            [{"Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": h["avg_cost"]} for h in saved["portfolio"]],
-            columns=["Ticker", "Shares", "Avg Cost"],
+            [{"Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": h["avg_cost"],
+              "Target %": h.get("target_pct"), "DRIP": bool(h.get("drip"))} for h in saved_pf],
+            columns=["Ticker", "Shares", "Avg Cost", "Target %", "DRIP"],
         )
         frame["Shares"] = pd.to_numeric(frame["Shares"], errors="coerce").astype("float64")
         frame["Avg Cost"] = pd.to_numeric(frame["Avg Cost"], errors="coerce").astype("float64")
-        st.session_state["portfolio_df"] = frame
-        st.session_state["portfolio_saved"] = saved["portfolio"]
+        frame["Target %"] = pd.to_numeric(frame["Target %"], errors="coerce").astype("float64")
+        st.session_state[pf_df_key] = frame
+        st.session_state[pf_saved_key] = saved_pf
 
     edited = st.data_editor(
-        st.session_state["portfolio_df"],
+        st.session_state[pf_df_key],
         num_rows="dynamic",
         hide_index=True,
         use_container_width=True,
-        key="portfolio_editor",
+        key=f"portfolio_editor_{pf_name}",
         column_config={
             "Ticker": st.column_config.TextColumn("Ticker"),
             "Shares": st.column_config.NumberColumn("Shares", min_value=0.0),
             "Avg Cost": st.column_config.NumberColumn("Avg Cost", min_value=0.0, format="$%.2f"),
+            "Target %": st.column_config.NumberColumn("Target % of account (blank = no target)", min_value=0.0, max_value=100.0),
+            "DRIP": st.column_config.CheckboxColumn("DRIP (dividends reinvested)"),
         },
     )
     holdings = clean_portfolio_rows(edited)
-    if holdings != st.session_state["portfolio_saved"]:
-        if save_portfolio(holdings):
-            st.session_state["portfolio_saved"] = holdings
+    if holdings != st.session_state[pf_saved_key]:
+        if save_portfolio(holdings, name=pf_name):
+            st.session_state[pf_saved_key] = holdings
         else:
             st.warning("Couldn't write user_data.json \u2014 changes won't persist after a restart.")
 
@@ -681,6 +796,7 @@ with tab_portfolio:
     else:
         rows, total_value, total_cost, total_div_income = [], 0.0, 0.0, 0.0
         review_items: List[Dict[str, Any]] = []
+        full_why_items: List[Dict[str, Any]] = []
         projection_items: List[Dict[str, Any]] = []
         projection_excluded: List[str] = []
         projection_cost_included = 0.0
@@ -691,10 +807,12 @@ with tab_portfolio:
                 if snap.get("error"):
                     rows.append({"Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": money(h["avg_cost"]), "Price": "\u2014",
                                  "Value": "\u2014", "Gain/Loss": "\u2014", "Gain %": "\u2014", "Sticker": "\u2014", "Moat": "\u2014",
-                                 "Meaning": "\u2014", "Moat type": "\u2014", "Weight": "\u2014", "Div Income/yr": "\u2014",
-                                 "Yield on Cost": "\u2014", "Flags": "\u2014", "Mkt Cap": "\u2014", "PEG": "\u2014", "Data": "\u2014",
-                                 "Signal": "NO DATA", "Why": snap["error"], "_rank": 9, "_value": 0.0, "_moat": 0.0})
-                    review_items.append({"Ticker": h["ticker"], "Signal": "NO DATA", "Reason": snap["error"], "_urgency": 0})
+                                 "Meaning": "\u2014", "Moat type": "\u2014", "Weight": "\u2014", "Target %": "\u2014", "Drift": "\u2014",
+                                 "Div Income/yr": "\u2014",
+                                 "Yield on Cost": "\u2014", "Flags": "\u2014", "Mkt Cap": "\u2014", "PEG": "\u2014",
+                                 "Owner Yield": "\u2014", "Data": "\u2014",
+                                 "Signal": "NO DATA", "Lean": "\u2014", "Why": _short_why(snap["error"]), "_rank": 9, "_value": 0.0, "_moat": 0.0})
+                    review_items.append({"Ticker": h["ticker"], "Signal": "NO DATA", "Lean": "\u2014", "Reason": snap["error"], "_urgency": 0})
                     continue
                 val = valuation_from_snapshot(snap, discount_rate, max_growth)
                 if snap.get("price_date"):
@@ -755,16 +873,34 @@ with tab_portfolio:
                     if (payout_pf is not None and payout_pf > 1.0) or (fcf_pf is not None and fcf_pf < 1.0):
                         review_reasons.append("Dividend in jeopardy (payout >100% or FCF cover <1x)")
                         review_urgency = min(review_urgency, 1)
+                lean_pf = sig.get("lean", "\u2014")
+                lean_note_pf = sig.get("lean_note", "")
+                if sig["signal"] == "REVIEW":
+                    why_short_pf = _short_why(f"Lean {lean_pf}: {lean_note_pf}") if lean_note_pf else _short_why("; ".join(sig["reasons"]))
+                else:
+                    why_short_pf = _short_why("; ".join(sig["reasons"]))
+                full_why_items.append({
+                    "Ticker": h["ticker"], "Signal": sig["signal"], "Lean": lean_pf,
+                    "Why": "; ".join(sig["reasons"]) + (f" | Lean: {lean_note_pf}" if lean_note_pf else ""),
+                })
                 if review_reasons:
-                    review_items.append({"Ticker": h["ticker"], "Signal": sig["signal"], "Reason": "; ".join(review_reasons), "_urgency": review_urgency})
+                    review_items.append({"Ticker": h["ticker"], "Signal": sig["signal"], "Lean": lean_pf, "Reason": "; ".join(review_reasons), "_urgency": review_urgency})
                 # Dividend income projection: current income grown at
-                # the 5-year dividend growth rate. Illustration only.
+                # the 5-year dividend growth rate. DRIP holdings also
+                # grow shares: each year's dividend is reinvested at
+                # today's price (flat-price assumption, stated in the
+                # UI). Illustration only, not a forecast.
                 if div_income is not None and dgr_pf is not None and dgr_pf >= 0:
-                    inc5 = div_income * ((1.0 + dgr_pf) ** 5)
-                    inc10 = div_income * ((1.0 + dgr_pf) ** 10)
-                    yoc10 = ((dps_pf * ((1.0 + dgr_pf) ** 10)) / h["avg_cost"]) if (dps_pf and h["avg_cost"]) else None
+                    if h.get("drip") and price and h["shares"] and dps_pf:
+                        inc5 = _project_drip_income(div_income, dps_pf, dgr_pf, price, h["shares"], 5)
+                        inc10 = _project_drip_income(div_income, dps_pf, dgr_pf, price, h["shares"], 10)
+                    else:
+                        inc5 = div_income * ((1.0 + dgr_pf) ** 5)
+                        inc10 = div_income * ((1.0 + dgr_pf) ** 10)
+                    yoc10 = (inc10 / (h["shares"] * h["avg_cost"])) if (h["shares"] and h["avg_cost"]) else None
                     projection_items.append({
-                        "Ticker": h["ticker"], "Income now": money(div_income),
+                        "Ticker": h["ticker"], "DRIP": "Yes" if h.get("drip") else "No",
+                        "Income now": money(div_income),
                         "Income in 5 yrs": money(inc5), "Income in 10 yrs": money(inc10),
                         "Yield on Cost in 10 yrs": "\u2014" if yoc10 is None else f"{yoc10:.1%}",
                         "_inc10": inc10,
@@ -773,28 +909,47 @@ with tab_portfolio:
                         projection_cost_included += h["shares"] * h["avg_cost"]
                 elif div_income is not None:
                     projection_excluded.append(h["ticker"])
+                oey_pf = _owner_earnings_yield(snap)
                 rows.append({
                     "Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": money(h["avg_cost"]), "Price": money(price),
                     "Value": money(value), "Gain/Loss": money(gain),
                     "Gain %": "\u2014" if gain_pct is None else f"{gain_pct:+.1f}%",
                     "Sticker": money(val["sticker_price"]), "Moat": snap["moat_score"],
                     "Meaning": note_pf.get("meaning") or "\u2014", "Moat type": note_pf.get("moat_type") or "\u2014",
-                    "Weight": "\u2014", "Div Income/yr": money(div_income) + dps_label if div_income is not None else "\u2014",
+                    "Weight": "\u2014", "Target %": "\u2014" if h.get("target_pct") is None else f"{h['target_pct']:.1f}%", "Drift": "\u2014",
+                    "Div Income/yr": money(div_income) + dps_label if div_income is not None else "\u2014",
                     "Yield on Cost": "\u2014" if yoc is None else f"{yoc:.1%}",
                     "Flags": "; ".join(det) if det else "\u2014",
                     "Mkt Cap": _format_market_cap(_market_cap(snap)),
                     "PEG": "\u2014" if peg_pf is None else f"{peg_pf:.2f}",
+                    "Owner Yield": "\u2014" if oey_pf is None else f"{oey_pf:.1%}",
                     "Data": f"{comp_pf['metrics']}/5" + (" ⚠️" if comp_pf["metrics"] <= 3 else ""),
-                    "Signal": sig["signal"], "Why": "; ".join(sig["reasons"]), "_rank": PORTFOLIO_RANK.get(sig["signal"], 9),
-                    "_value": value or 0.0, "_moat": snap["moat_score"] or 0.0,
+                    "Signal": sig["signal"], "Lean": lean_pf, "Why": why_short_pf,
+                    "_rank": PORTFOLIO_RANK.get(sig["signal"], 9),
+                    "_value": value or 0.0, "_moat": snap["moat_score"] or 0.0, "_target": h.get("target_pct"),
+                    "_ticker_for_log": h["ticker"], "_price_for_log": price, "_sticker_for_log": val["sticker_price"],
                 })
-        # Weights and weighted moat need the total first.
+        # Weights are % of total account value (holdings + cash), so a
+        # cash balance makes weights real instead of holdings-only.
+        total_account = total_value + cash_balance
         for r in rows:
-            if total_value > 0 and r["_value"]:
-                r["Weight"] = f"{r['_value'] / total_value:.1%}"
+            if total_account > 0 and r["_value"]:
+                r["Weight"] = f"{r['_value'] / total_account:.1%}"
+                if r.get("_target") is not None:
+                    r["Drift"] = f"{(r['_value'] / total_account * 100.0 - r['_target']):+.1f}%"
         weighted_moat = (sum(r["_value"] * r["_moat"] for r in rows) / total_value) if total_value > 0 else None
         largest = max(rows, key=lambda r: r["_value"]) if rows else None
         rows.sort(key=lambda r: r["_rank"])
+        # Signal log: one entry per ticker per day (today's entry is
+        # updated on re-check, past days are never rewritten).
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        log_entries = [
+            {"date": today_str, "ticker": r["_ticker_for_log"], "price": r["_price_for_log"],
+             "sticker": r["_sticker_for_log"], "signal": r["Signal"], "lean": r["Lean"]}
+            for r in rows if r.get("_ticker_for_log")
+        ]
+        if log_entries:
+            append_signal_log(log_entries)
         # Review queue first: only holdings needing attention, sorted
         # by urgency (SELL, then REVIEW/jeopardy, then other flags).
         if review_items:
@@ -803,16 +958,28 @@ with tab_portfolio:
             st.dataframe(pd.DataFrame(review_items).drop(columns=["_urgency"]), hide_index=True, use_container_width=True)
         else:
             st.caption("Review queue: no holdings need attention right now.")
-        df = pd.DataFrame(rows).drop(columns=["_rank", "_value", "_moat"])
+        df = pd.DataFrame(rows).drop(columns=["_rank", "_value", "_moat", "_target", "_ticker_for_log", "_price_for_log", "_sticker_for_log"])
         st.dataframe(style_signal_column(df), hide_index=True, use_container_width=True)
         as_of_pf = _prices_as_of_caption(portfolio_price_dates)
         if as_of_pf:
             st.caption(as_of_pf)
+        # Full Why, in wrapping text — the table's Why column is kept
+        # short on purpose, because long Why text ran off the page.
+        with st.expander("Why, in full — every holding's reasons and lean", expanded=False):
+            for item in full_why_items:
+                st.markdown(f"**{item['Ticker']} — {item['Signal']} (Lean: {item['Lean']})** — {item['Why']}")
+            st.caption("Lean is a reading of the reasons, not a new signal. SELL still means sell, BUY still means add.")
         if total_cost > 0:
             total_gain = total_value - total_cost
             st.markdown(
                 f"**Portfolio totals:** value {money(total_value)} \u00b7 cost basis {money(total_cost)} \u00b7 "
                 f"gain/loss {money(total_gain)} ({total_gain / total_cost:+.1%})"
+            )
+        if cash_balance > 0 or total_account > 0:
+            st.markdown(
+                f"**Cash:** {money(cash_balance)}"
+                + (f" ({cash_balance / total_account:.1%} of account)" if total_account > 0 else "")
+                + f" \u00b7 **Total account value:** {money(total_account)} (holdings + cash)"
             )
         if total_div_income > 0:
             st.markdown(
@@ -822,8 +989,8 @@ with tab_portfolio:
             )
         if weighted_moat is not None:
             st.markdown(f"**Weighted Moat Score:** {weighted_moat:.1f} / 100 (by position value)")
-        if largest is not None and total_value > 0 and largest["_value"]:
-            st.markdown(f"**Largest holding:** {largest['Ticker']} at {largest['_value'] / total_value:.1%} of portfolio value")
+        if largest is not None and total_account > 0 and largest["_value"]:
+            st.markdown(f"**Largest holding:** {largest['Ticker']} at {largest['_value'] / total_account:.1%} of account value")
         # Dividend income projection, if growth continues at the 5-year
         # rate. This is an illustration, not a forecast — growth rates
         # change, dividends can be cut, and holdings without a known
@@ -837,11 +1004,53 @@ with tab_portfolio:
                 f"Projected total in 10 yrs: {money(total_inc10)}/yr"
                 + (f" \u00b7 projected yield on cost (included holdings only): {total_inc10 / projection_cost_included:.1%}" if projection_cost_included > 0 else "")
                 + (f" \u00b7 excluded (no DPS or growth rate): {', '.join(projection_excluded)}" if projection_excluded else "")
+                + " \u00b7 DRIP holdings assume price stays at today's price, so reinvested dividends buy shares at today's price."
                 + " \u00b7 Illustration only, not a forecast."
             )
         counts = Counter(r["Signal"] for r in rows)
         st.caption(" \u00b7 ".join(f"{n} {s}" for s, n in counts.most_common()))
+        _table_downloads(df, f"pf_{pf_name}", f"{pf_name}_portfolio")
+        # Signal log: what past signals said, and what prices did after.
+        with st.expander("Signal log — past signals and what prices did after", expanded=False):
+            signal_log = (load_user_data().get("signal_log") or [])
+            if not signal_log:
+                st.caption("No logged signals yet — today's check is logged above, once per ticker per day.")
+            else:
+                recent_log = signal_log[-50:][::-1]
+                st.dataframe(pd.DataFrame(recent_log), hide_index=True, use_container_width=True)
+                # Track record: BUY entries older than 30 days for tickers
+                # still held, vs their current price. Price change since
+                # the signal, NOT a realized return — you may not have bought.
+                # Raw prices live on rows as _price_for_log (dropped from
+                # the displayed df, still present in the rows list).
+                current_prices = {r["Ticker"]: r["_price_for_log"] for r in rows if r.get("_price_for_log")}
+                buy_tracked = []
+                for entry in signal_log:
+                    if entry.get("signal") != "BUY" or entry.get("ticker") not in current_prices:
+                        continue
+                    try:
+                        entry_date = datetime.strptime(entry["date"], "%Y-%m-%d").date()
+                    except Exception:
+                        continue
+                    days = (datetime.now().date() - entry_date).days
+                    if days >= 30 and entry.get("price"):
+                        buy_tracked.append((current_prices[entry["ticker"]] / entry["price"] - 1.0))
+                if buy_tracked:
+                    winners = sum(1 for x in buy_tracked if x > 0)
+                    st.caption(
+                        f"BUY signals older than 30 days (still-held tickers): {len(buy_tracked)} entries, "
+                        f"average price change since signal {sum(buy_tracked) / len(buy_tracked):+.1%}, "
+                        f"{winners}/{len(buy_tracked)} positive. Price change since signal, not a realized return."
+                    )
+                else:
+                    st.caption("No BUY signals older than 30 days for currently held tickers yet.")
+                log_df = pd.DataFrame(signal_log)
+                st.download_button(
+                    "Download signal log (CSV)", data=log_df.to_csv(index=False),
+                    file_name="signal_log.csv", mime="text/csv", key="pf_log_csv",
+                )
         export_data = load_user_data()
+        export_data["portfolios"] = {pf_name: holdings}
         export_data["portfolio"] = holdings
         st.download_button(
             "Download portfolio + notes (JSON)",
@@ -865,25 +1074,53 @@ with tab_watchlist:
     with w2:
         near_buy_pct = st.slider("'Near buy' band: within X% above the buy price", 0, 50, 15, key="wl_near")
 
-    if "watchlist_df" not in st.session_state:
-        saved = load_user_data()
-        st.session_state["watchlist_df"] = pd.DataFrame({"Ticker": pd.Series(saved["watchlist"], dtype="object")})
-        st.session_state["watchlist_saved"] = saved["watchlist"]
+    # Named watchlists, same pattern as named portfolios.
+    saved_wl_all = load_user_data()
+    watchlist_names = list((saved_wl_all.get("watchlists") or {"Main": []}).keys()) or ["Main"]
+    if "wl_selected_name" not in st.session_state or st.session_state["wl_selected_name"] not in watchlist_names:
+        st.session_state["wl_selected_name"] = watchlist_names[0]
+    wl_name = st.selectbox("Watchlist", watchlist_names, key="wl_selected_name")
+    wl_c1, wl_c2, wl_c3 = st.columns(3)
+    with wl_c1:
+        new_wl_name = st.text_input("New watchlist name", key="wl_new_name").strip()
+    with wl_c2:
+        if st.button("Add watchlist", key="wl_add_btn") and new_wl_name:
+            if new_wl_name in watchlist_names:
+                st.warning(f"A watchlist named {new_wl_name} already exists.")
+            elif save_watchlist([], name=new_wl_name):
+                st.session_state["wl_selected_name"] = new_wl_name
+                st.rerun()
+    with wl_c3:
+        if len(watchlist_names) > 1 and st.button(f"Delete watchlist '{wl_name}'", key="wl_del_btn"):
+            st.warning("Deleting cannot be undone — export first if you want a backup.")
+            if delete_watchlist(wl_name):
+                st.session_state["wl_selected_name"] = watchlist_names[0]
+                for k in list(st.session_state.keys()):
+                    if k.startswith("watchlist_df_") or k.startswith("watchlist_saved_"):
+                        st.session_state.pop(k, None)
+                st.rerun()
+
+    wl_df_key = f"watchlist_df_{wl_name}"
+    wl_saved_key = f"watchlist_saved_{wl_name}"
+    if wl_df_key not in st.session_state:
+        saved_wl = (load_user_data().get("watchlists") or {}).get(wl_name, [])
+        st.session_state[wl_df_key] = pd.DataFrame({"Ticker": pd.Series(saved_wl, dtype="object")})
+        st.session_state[wl_saved_key] = saved_wl
 
     edited_w = st.data_editor(
-        st.session_state["watchlist_df"],
+        st.session_state[wl_df_key],
         num_rows="dynamic",
         hide_index=True,
         use_container_width=True,
-        key="watchlist_editor",
+        key=f"watchlist_editor_{wl_name}",
         column_config={"Ticker": st.column_config.TextColumn("Ticker")},
     )
     watch = list(dict.fromkeys(
         t for t in (normalize_ticker(_cell(v) or "") for v in edited_w["Ticker"]) if t
     ))
-    if watch != st.session_state["watchlist_saved"]:
-        if save_watchlist(watch):
-            st.session_state["watchlist_saved"] = watch
+    if watch != st.session_state[wl_saved_key]:
+        if save_watchlist(watch, name=wl_name):
+            st.session_state[wl_saved_key] = watch
         else:
             st.warning("Couldn't write user_data.json \u2014 changes won't persist after a restart.")
 
@@ -891,23 +1128,26 @@ with tab_watchlist:
         st.info("Add a ticker above to see its buy signal.")
     else:
         rows = []
+        watch_full_why: List[Dict[str, Any]] = []
         watch_price_dates: List[Any] = []
         with st.spinner("Checking your watchlist..."):
             for t in watch:
                 snap = build_snapshot(t, price_max_age=TRACKING_PRICE_MAX_AGE)
                 if snap.get("error"):
                     rows.append({"Ticker": t, "Price": "\u2014", "Sticker": "\u2014", "Buy Below": "\u2014", "% Above Buy Price": "\u2014",
-                                 "Moat": "\u2014", "Mkt Cap": "\u2014", "PEG": "\u2014", "Data": "\u2014", "Flags": "\u2014",
-                                 "Signal": "NO DATA", "Why": snap["error"], "_rank": 9, "_pct": 1e9})
+                                 "Moat": "\u2014", "Mkt Cap": "\u2014", "PEG": "\u2014", "Owner Yield": "\u2014", "Data": "\u2014", "Flags": "\u2014",
+                                 "Signal": "NO DATA", "Why": _short_why(snap["error"]), "_rank": 9, "_pct": 1e9})
                     continue
                 val = valuation_from_snapshot(snap, discount_rate, max_growth)
                 sig = buy_signal(snap, val, float(min_moat_buy), float(near_buy_pct))
                 pct = sig["pct_above_buy"]
                 comp_w = _data_completeness(snap["gatekeeper"])
                 peg_w = _peg_ratio(snap)
+                oey_w = _owner_earnings_yield(snap)
                 det_w = _deterioration_flags(snap)
                 if snap.get("price_date"):
                     watch_price_dates.append(snap["price_date"])
+                watch_full_why.append({"Ticker": t, "Signal": sig["signal"], "Why": "; ".join(sig["reasons"])})
                 rows.append({
                     "Ticker": t, "Price": money(snap["current_price"]), "Sticker": money(val["sticker_price"]),
                     "Buy Below": money(val["margin_of_safety_price"]),
@@ -915,9 +1155,10 @@ with tab_watchlist:
                     "Moat": snap["moat_score"],
                     "Mkt Cap": _format_market_cap(_market_cap(snap)),
                     "PEG": "\u2014" if peg_w is None else f"{peg_w:.2f}",
+                    "Owner Yield": "\u2014" if oey_w is None else f"{oey_w:.1%}",
                     "Data": f"{comp_w['metrics']}/5" + (" ⚠️" if comp_w["metrics"] <= 3 else ""),
                     "Flags": "; ".join(det_w) if det_w else "\u2014",
-                    "Signal": sig["signal"], "Why": "; ".join(sig["reasons"]),
+                    "Signal": sig["signal"], "Why": _short_why("; ".join(sig["reasons"])),
                     "_rank": BUY_RANK.get(sig["signal"], 9), "_pct": pct if pct is not None else 1e9,
                 })
         rows.sort(key=lambda r: (r["_rank"], r["_pct"]))
@@ -926,6 +1167,10 @@ with tab_watchlist:
         as_of_w = _prices_as_of_caption(watch_price_dates)
         if as_of_w:
             st.caption(as_of_w)
+        with st.expander("Why, in full", expanded=False):
+            for item in watch_full_why:
+                st.markdown(f"**{item['Ticker']} — {item['Signal']}** — {item['Why']}")
+        _table_downloads(df, f"wl_{wl_name}", f"{wl_name}_watchlist")
         counts = Counter(r["Signal"] for r in rows)
         st.caption(" \u00b7 ".join(f"{n} {s}" for s, n in counts.most_common()))
 
@@ -1030,6 +1275,7 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
             snap_row = snap_map_all.get(r["ticker"], {})
             comp_row = _data_completeness(snap_row.get("gatekeeper") or {}) if snap_row else {"metrics": 0, "horizons": 0, "missing_metrics": []}
             peg_row = _peg_ratio(snap_row) if snap_row else None
+            oey_row = _owner_earnings_yield(snap_row) if snap_row else None
             row: Dict[str, Any] = {
                 "#": i, "Ticker": r["ticker"], "Company": r["name"] or "", "Price": money(r["current_price"]),
                 "Sticker": money(r["sticker_price"]), "MOS Price": money(r["margin_of_safety_price"]),
@@ -1039,6 +1285,7 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
                 "Action": r["action"].replace("_", " "), "Div. Streak (yrs)": r["dividend_streak"],
                 "Mkt Cap": _format_market_cap(_market_cap(snap_row)) if snap_row else "\u2014",
                 "PEG": "\u2014" if peg_row is None else f"{peg_row:.2f}",
+                "Owner Yield": "\u2014" if oey_row is None else f"{oey_row:.1%}",
                 "Data": f"{comp_row['metrics']}/5" + (" ⚠️" if comp_row["metrics"] <= 3 else ""),
             }
             if dividend_mode:
@@ -1118,13 +1365,7 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
                 )
             rows.append(row)
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-        st.download_button(
-            "Download this Top 25 (CSV)",
-            data=pd.DataFrame(rows).to_csv(index=False),
-            file_name="top25.csv",
-            mime="text/csv",
-            key=download_key,
-        )
+        _table_downloads(pd.DataFrame(rows), download_key, "top25")
     if scan["errors"]:
         reasons = Counter(scan["errors"].values())
         with st.expander(f"{len(scan['errors'])} tickers skipped \u2014 why"):
@@ -1198,6 +1439,26 @@ with tab_undervalued:
     )
     min_moat_scan = st.slider("Minimum Moat Score (filter)", 0, 100, 0, key="scan_moat")
     min_cap_scan = st.number_input("Minimum market cap ($ billions, 0 = no minimum; unknown cap does not exclude)", 0.0, 10000.0, 0.0, key="scan_mincap")
+    # Saved filter presets (Undervalued tab only): selecting one
+    # overrides the sliders above, so a favourite filter set is one
+    # click instead of re-setting every slider.
+    with st.expander("Filter presets", expanded=False):
+        uv_presets = (load_user_data().get("scan_presets") or {}).get("undervalued", {}) or {}
+        uv_preset_name = st.selectbox("Preset (overrides sliders while selected)", ["(sliders)"] + list(uv_presets.keys()), key="uv_preset_sel")
+        uv_new_name = st.text_input("Save current filters as preset", key="uv_preset_new").strip()
+        if st.button("Save preset", key="uv_preset_save") and uv_new_name:
+            if save_scan_preset("undervalued", uv_new_name, {"quality_first": bool(quality_first_scan), "min_moat": float(min_moat_scan), "min_cap_b": float(min_cap_scan)}):
+                st.success(f"Saved preset '{uv_new_name}'.")
+                st.rerun()
+        if uv_preset_name != "(sliders)" and st.button("Delete preset", key="uv_preset_del"):
+            if delete_scan_preset("undervalued", uv_preset_name):
+                st.rerun()
+    if uv_preset_name != "(sliders)":
+        uv_p = uv_presets.get(uv_preset_name, {}) or {}
+        quality_first_scan = bool(uv_p.get("quality_first", True))
+        min_moat_scan = float(uv_p.get("min_moat", 0))
+        min_cap_scan = float(uv_p.get("min_cap_b", 0))
+        st.caption(f"Using preset '{uv_preset_name}' — sliders are ignored until you switch back to (sliders).")
     if "scan" in st.session_state:
         render_ranked_table(st.session_state["scan"], 0, float(min_moat_scan), quality_first=quality_first_scan, download_key="scan_csv", min_market_cap_b=float(min_cap_scan))
     else:
@@ -1220,6 +1481,31 @@ with tab_dividends:
         "Wonderful businesses first (same hurdle step-down as the Undervalued tab)",
         value=True, key="div_quality_first",
     )
+    with st.expander("Filter presets", expanded=False):
+        div_presets = (load_user_data().get("scan_presets") or {}).get("dividend", {}) or {}
+        div_preset_name = st.selectbox("Preset (overrides sliders while selected)", ["(sliders)"] + list(div_presets.keys()), key="div_preset_sel")
+        div_new_name = st.text_input("Save current filters as preset", key="div_preset_new").strip()
+        if st.button("Save preset", key="div_preset_save") and div_new_name:
+            if save_scan_preset("dividend", div_new_name, {
+                "div_years": int(div_years), "min_moat": float(min_moat_div), "max_payout": float(max_payout_div),
+                "min_div_growth": float(min_div_growth_div), "min_chowder": float(min_chowder_div),
+                "min_cap_b": float(min_cap_div), "quality_first": bool(quality_first_div),
+            }):
+                st.success(f"Saved preset '{div_new_name}'.")
+                st.rerun()
+        if div_preset_name != "(sliders)" and st.button("Delete preset", key="div_preset_del"):
+            if delete_scan_preset("dividend", div_preset_name):
+                st.rerun()
+    if div_preset_name != "(sliders)":
+        dv_p = div_presets.get(div_preset_name, {}) or {}
+        div_years = int(dv_p.get("div_years", 5))
+        min_moat_div = float(dv_p.get("min_moat", 0))
+        max_payout_div = float(dv_p.get("max_payout", 65))
+        min_div_growth_div = float(dv_p.get("min_div_growth", 4))
+        min_chowder_div = float(dv_p.get("min_chowder", 0))
+        min_cap_div = float(dv_p.get("min_cap_b", 0))
+        quality_first_div = bool(dv_p.get("quality_first", True))
+        st.caption(f"Using preset '{div_preset_name}' — sliders are ignored until you switch back to (sliders).")
     with st.expander("\u270f\ufe0f Manual dividend data — fill in a field the SEC pull missed"):
         st.caption(
             "Use this when a metric shows \u2014 in the table but you found it yourself (annual report, company "

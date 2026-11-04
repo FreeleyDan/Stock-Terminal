@@ -160,6 +160,21 @@ def portfolio_signal(
     A loss vs cost alone does not block a BUY: being down is not a
     business-quality signal, and a wonderful business that fell to its
     MOS price can still be an add. It is still noted in the reasons.
+
+    Every result also carries a "lean" — a keep/sell reading of the
+    signal, because REVIEW alone does not say which way to lean:
+      SELL signal / quality REVIEW -> lean SELL (fair value reached,
+        or the business itself changed — the Rule #1 sell trigger)
+      WEAK REVIEW (cheap but moat too weak to add) -> lean KEEP
+        (hold, do not add)
+      approaching-Sticker REVIEW -> lean KEEP (hold until Sticker,
+        then sell)
+      loss-limit REVIEW -> lean SELL (your loss limit was hit;
+        only keep if the thesis is unchanged and you can say why)
+      BUY -> lean ADD, NEAR BUY / HOLD -> lean KEEP, no valuation ->
+        lean UNKNOWN (price alone cannot judge it).
+    The lean is a reading of the reasons, not a new signal: a SELL
+    signal still means sell, and a BUY signal still means add.
     """
     price = snapshot.get("current_price")
     sticker = valuation.get("sticker_price")
@@ -171,12 +186,14 @@ def portfolio_signal(
 
     if price is None or sticker is None or mos is None:
         sell = sell_signal(snapshot, valuation, avg_cost, approach_pct, min_moat_hold, max_loss_pct)
-        return {"signal": REVIEW, "reasons": sell["reasons"]}
+        return {"signal": REVIEW, "reasons": sell["reasons"], "lean": "UNKNOWN",
+                "lean_note": "No valuation — price alone cannot say keep or sell"}
 
     if price >= sticker:
         return {
             "signal": SELL,
             "reasons": [f"Price {_money(price)} is at/above Sticker Price {_money(sticker)} (fair value reached)"],
+            "lean": "SELL", "lean_note": "Fair value reached",
         }
 
     if quality_review:
@@ -185,23 +202,35 @@ def portfolio_signal(
             reasons.append(f"Moat Score {moat:g} is below {min_moat_hold:g} — do not add")
         if debt_failed:
             reasons.append("Debt Test failed (long-term debt > 3x owner earnings) — do not add")
-        return {"signal": REVIEW, "reasons": reasons}
+        return {"signal": REVIEW, "reasons": reasons, "lean": "SELL",
+                "lean_note": "Business quality deteriorated — a changed business is the Rule #1 sell trigger"}
 
     buy = buy_signal(snapshot, valuation, min_moat_buy, near_buy_pct)
     if buy["signal"] == BUY:
-        return {"signal": BUY, "reasons": ["Owned holding — add signal:"] + buy["reasons"]}
+        return {"signal": BUY, "reasons": ["Owned holding — add signal:"] + buy["reasons"],
+                "lean": "ADD", "lean_note": "Wonderful business at/below its buy price"}
     if buy["signal"] == NEAR_BUY:
-        return {"signal": NEAR_BUY, "reasons": ["Owned holding — near-add signal:"] + buy["reasons"]}
+        return {"signal": NEAR_BUY, "reasons": ["Owned holding — near-add signal:"] + buy["reasons"],
+                "lean": "KEEP", "lean_note": "Close to its buy price — hold until it reaches it"}
     if buy["signal"] == WEAK:
-        return {"signal": REVIEW, "reasons": buy["reasons"] + ["Do not add — moat is too weak"]}
+        return {"signal": REVIEW, "reasons": buy["reasons"] + ["Do not add — moat is too weak"],
+                "lean": "KEEP", "lean_note": "Cheap but too weak to add — hold, do not add"}
 
     reasons: List[str] = []
-    if price >= sticker * (1 - approach_pct / 100.0):
+    approaching = price >= sticker * (1 - approach_pct / 100.0)
+    if approaching:
         reasons.append(f"Price is within {approach_pct:g}% of Sticker Price {_money(sticker)}")
+    loss_hit = False
     if max_loss_pct > 0 and avg_cost and price is not None and avg_cost > 0:
         loss_pct = (avg_cost - price) / avg_cost * 100.0
         if loss_pct >= max_loss_pct:
+            loss_hit = True
             reasons.append(f"Down {loss_pct:.1f}% vs your cost (your {max_loss_pct:g}% limit)")
     if reasons:
-        return {"signal": REVIEW, "reasons": reasons}
-    return {"signal": HOLD, "reasons": ["Below fair value with acceptable quality"]}
+        if loss_hit:
+            return {"signal": REVIEW, "reasons": reasons, "lean": "SELL",
+                    "lean_note": "Loss limit hit — consider exiting unless the thesis is unchanged"}
+        return {"signal": REVIEW, "reasons": reasons, "lean": "KEEP",
+                "lean_note": "Hold until Sticker Price, then sell"}
+    return {"signal": HOLD, "reasons": ["Below fair value with acceptable quality"],
+            "lean": "KEEP", "lean_note": "Below fair value with acceptable quality"}

@@ -47,7 +47,63 @@ MANUAL_SECTOR_OPTIONS = ("Utility", "REIT", "Other / standard")
 
 
 def _empty() -> Dict[str, Any]:
-    return {"portfolio": [], "watchlist": [], "notes": {}, "manual": {}}
+    return {
+        "portfolio": [], "watchlist": [], "notes": {}, "manual": {},
+        "portfolios": {"Main": []}, "watchlists": {"Main": []},
+        "portfolio_cash": {"Main": 0.0}, "scan_presets": {"undervalued": {}, "dividend": {}},
+        "signal_log": [],
+    }
+
+
+def _clean_holding(row: Any) -> Optional[Dict[str, Any]]:
+    """One holding: ticker, shares, avg_cost, plus optional target_pct
+    (0-100, % of account) and drip (bool). Missing optionals stay None/False."""
+    if not isinstance(row, dict) or not normalize_ticker(row.get("ticker", "")):
+        return None
+    holding: Dict[str, Any] = {
+        "ticker": normalize_ticker(row["ticker"]),
+        "shares": _to_float(row.get("shares")),
+        "avg_cost": _to_float(row.get("avg_cost")),
+    }
+    target = _to_float(row.get("target_pct"))
+    if target is not None:
+        holding["target_pct"] = max(0.0, min(100.0, target))
+    holding["drip"] = bool(row.get("drip")) if row.get("drip") is not None else False
+    return holding
+
+
+def _clean_portfolios(raw: Any, legacy: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """Named portfolios. Legacy single-list files migrate to {"Main": [...]}.
+    Empty names are dropped; a file with no portfolios at all gets Main."""
+    portfolios: Dict[str, List[Dict[str, Any]]] = {}
+    if isinstance(raw, dict):
+        for name, rows in raw.items():
+            if not isinstance(name, str) or not name.strip() or not isinstance(rows, list):
+                continue
+            cleaned = [h for h in (_clean_holding(r) for r in rows) if h is not None]
+            portfolios[name.strip()] = cleaned
+    if not portfolios and isinstance(legacy, list):
+        cleaned = [h for h in (_clean_holding(r) for r in legacy) if h is not None]
+        portfolios["Main"] = cleaned
+    if not portfolios:
+        portfolios["Main"] = []
+    return portfolios
+
+
+def _clean_watchlists(raw: Any, legacy: Any) -> Dict[str, List[str]]:
+    watchlists: Dict[str, List[str]] = {}
+    if isinstance(raw, dict):
+        for name, tickers in raw.items():
+            if not isinstance(name, str) or not name.strip() or not isinstance(tickers, list):
+                continue
+            cleaned = list(dict.fromkeys(t for t in (normalize_ticker(t) for t in tickers) if t))
+            watchlists[name.strip()] = cleaned
+    if not watchlists and isinstance(legacy, list):
+        cleaned = list(dict.fromkeys(t for t in (normalize_ticker(t) for t in legacy) if t))
+        watchlists["Main"] = cleaned
+    if not watchlists:
+        watchlists["Main"] = []
+    return watchlists
 
 
 def _clean_manual(raw_manual: Any) -> Dict[str, Any]:
@@ -105,17 +161,34 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
             pass
         return _empty()
 
-    portfolio = []
-    for row in data.get("portfolio", []) or []:
-        if isinstance(row, dict) and normalize_ticker(row.get("ticker", "")):
-            portfolio.append(
-                {
-                    "ticker": normalize_ticker(row["ticker"]),
-                    "shares": _to_float(row.get("shares")),
-                    "avg_cost": _to_float(row.get("avg_cost")),
-                }
-            )
-    watchlist = [normalize_ticker(t) for t in (data.get("watchlist", []) or []) if normalize_ticker(t)]
+    portfolios = _clean_portfolios(data.get("portfolios"), data.get("portfolio", []))
+    watchlists = _clean_watchlists(data.get("watchlists"), data.get("watchlist", []))
+    # Legacy keys stay populated (first portfolio / watchlist) so older
+    # callers keep working; new code should use portfolios/watchlists.
+    portfolio = portfolios.get("Main") or next(iter(portfolios.values()), [])
+    watchlist = watchlists.get("Main") or next(iter(watchlists.values()), [])
+    cash: Dict[str, float] = {}
+    raw_cash = data.get("portfolio_cash", {}) or {}
+    if isinstance(raw_cash, dict):
+        for name, v in raw_cash.items():
+            f = _to_float(v)
+            if isinstance(name, str) and name.strip() and f is not None:
+                cash[name.strip()] = max(0.0, f)
+    presets: Dict[str, Dict[str, Any]] = {"undervalued": {}, "dividend": {}}
+    raw_presets = data.get("scan_presets", {}) or {}
+    if isinstance(raw_presets, dict):
+        for tab in ("undervalued", "dividend"):
+            tab_presets = raw_presets.get(tab, {}) or {}
+            if isinstance(tab_presets, dict):
+                presets[tab] = {k: v for k, v in tab_presets.items() if isinstance(k, str) and isinstance(v, dict)}
+    log: List[Dict[str, Any]] = []
+    for entry in data.get("signal_log", []) or []:
+        if isinstance(entry, dict) and entry.get("date") and normalize_ticker(entry.get("ticker", "")):
+            log.append({
+                "date": str(entry["date"])[:10], "ticker": normalize_ticker(entry["ticker"]),
+                "price": _to_float(entry.get("price")), "sticker": _to_float(entry.get("sticker")),
+                "signal": str(entry.get("signal", "")), "lean": str(entry.get("lean", "")),
+            })
     notes: Dict[str, Any] = {}
     raw_notes = data.get("notes", {}) or {}
     if isinstance(raw_notes, dict):
@@ -130,7 +203,12 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
                     notes[clean_ticker][k] = int(notes[clean_ticker][k])
                 except (TypeError, ValueError):
                     notes[clean_ticker][k] = ""
-    return {"portfolio": portfolio, "watchlist": list(dict.fromkeys(watchlist)), "notes": notes, "manual": _clean_manual(data.get("manual", {}))}
+    return {
+        "portfolio": portfolio, "watchlist": list(dict.fromkeys(watchlist)),
+        "portfolios": portfolios, "watchlists": watchlists, "portfolio_cash": cash,
+        "scan_presets": presets, "signal_log": log,
+        "notes": notes, "manual": _clean_manual(data.get("manual", {})),
+    }
 
 
 def save_user_data(data: Dict[str, Any], path: str = DATA_FILE) -> bool:
@@ -145,15 +223,108 @@ def save_user_data(data: Dict[str, Any], path: str = DATA_FILE) -> bool:
         return False
 
 
-def save_portfolio(holdings: List[Dict[str, Any]], path: str = DATA_FILE) -> bool:
+def save_portfolio(holdings: List[Dict[str, Any]], name: str = "Main", path: str = DATA_FILE) -> bool:
+    """Save one named portfolio, preserving the others. Legacy single-arg
+    calls save to Main, as before."""
     data = load_user_data(path)
-    data["portfolio"] = holdings
+    portfolios = dict(data.get("portfolios") or {})
+    portfolios[name] = [h for h in (_clean_holding(r) for r in holdings) if h is not None]
+    data["portfolios"] = portfolios
+    if name == "Main":
+        data["portfolio"] = portfolios["Main"]
     return save_user_data(data, path)
 
 
-def save_watchlist(tickers: List[str], path: str = DATA_FILE) -> bool:
+def delete_portfolio(name: str, path: str = DATA_FILE) -> bool:
     data = load_user_data(path)
-    data["watchlist"] = tickers
+    portfolios = dict(data.get("portfolios") or {})
+    if name not in portfolios or len(portfolios) <= 1:
+        return False
+    portfolios.pop(name, None)
+    cash = dict(data.get("portfolio_cash") or {})
+    cash.pop(name, None)
+    data["portfolios"] = portfolios
+    data["portfolio_cash"] = cash
+    data["portfolio"] = portfolios.get("Main") or next(iter(portfolios.values()), [])
+    return save_user_data(data, path)
+
+
+def save_watchlist(tickers: List[str], name: str = "Main", path: str = DATA_FILE) -> bool:
+    data = load_user_data(path)
+    watchlists = dict(data.get("watchlists") or {})
+    watchlists[name] = list(dict.fromkeys(t for t in (normalize_ticker(t) for t in tickers) if t))
+    data["watchlists"] = watchlists
+    if name == "Main":
+        data["watchlist"] = watchlists["Main"]
+    return save_user_data(data, path)
+
+
+def delete_watchlist(name: str, path: str = DATA_FILE) -> bool:
+    data = load_user_data(path)
+    watchlists = dict(data.get("watchlists") or {})
+    if name not in watchlists or len(watchlists) <= 1:
+        return False
+    watchlists.pop(name, None)
+    data["watchlists"] = watchlists
+    data["watchlist"] = watchlists.get("Main") or next(iter(watchlists.values()), [])
+    return save_user_data(data, path)
+
+
+def save_cash(portfolio_name: str, cash: float, path: str = DATA_FILE) -> bool:
+    data = load_user_data(path)
+    cash_map = dict(data.get("portfolio_cash") or {})
+    cash_map[portfolio_name] = max(0.0, float(cash) if cash else 0.0)
+    data["portfolio_cash"] = cash_map
+    return save_user_data(data, path)
+
+
+def save_scan_preset(tab: str, name: str, values: Dict[str, Any], path: str = DATA_FILE) -> bool:
+    if tab not in ("undervalued", "dividend") or not name.strip():
+        return False
+    data = load_user_data(path)
+    presets = data.get("scan_presets") or {"undervalued": {}, "dividend": {}}
+    presets.setdefault(tab, {})[name.strip()] = values
+    data["scan_presets"] = presets
+    return save_user_data(data, path)
+
+
+def delete_scan_preset(tab: str, name: str, path: str = DATA_FILE) -> bool:
+    data = load_user_data(path)
+    presets = data.get("scan_presets") or {}
+    if name in (presets.get(tab) or {}):
+        presets[tab].pop(name, None)
+        data["scan_presets"] = presets
+        return save_user_data(data, path)
+    return False
+
+
+def append_signal_log(entries: List[Dict[str, Any]], path: str = DATA_FILE) -> bool:
+    """Append signal-log entries, one per (date, ticker). Today's entry
+    for a ticker is updated (not duplicated) if it is logged again, so
+    re-checking during the day refreshes today's price/signal instead
+    of piling up rows. Past days are never rewritten. Capped at 2000
+    entries (oldest dropped)."""
+    if not entries:
+        return True
+    data = load_user_data(path)
+    log = list(data.get("signal_log") or [])
+    by_key = {(e.get("date"), e.get("ticker")): i for i, e in enumerate(log)}
+    for entry in entries:
+        date = str(entry.get("date", ""))[:10]
+        ticker = normalize_ticker(entry.get("ticker", ""))
+        if not date or not ticker:
+            continue
+        clean = {
+            "date": date, "ticker": ticker,
+            "price": _to_float(entry.get("price")), "sticker": _to_float(entry.get("sticker")),
+            "signal": str(entry.get("signal", "")), "lean": str(entry.get("lean", "")),
+        }
+        if (date, ticker) in by_key:
+            log[by_key[(date, ticker)]] = clean
+        else:
+            by_key[(date, ticker)] = len(log)
+            log.append(clean)
+    data["signal_log"] = log[-2000:]
     return save_user_data(data, path)
 
 
@@ -249,3 +420,39 @@ def parse_imported_data(data: Any) -> Tuple[List[Dict[str, Any]], List[str], Dic
                 notes[normalize_ticker(ticker)] = {k: note.get(k, "") for k in NOTE_FIELDS}
     manual = _clean_manual(data.get("manual", {}))
     return portfolio, list(dict.fromkeys(watchlist)), notes, manual
+
+
+def parse_imported_full(data: Any) -> Dict[str, Any]:
+    """Full import: named portfolios/watchlists if present, else the
+    legacy single portfolio/watchlist as Main. Raises ValueError if
+    neither a portfolios dict nor a portfolio list is present."""
+    if not isinstance(data, dict):
+        raise ValueError("Expected a JSON object with portfolios or a portfolio list")
+    portfolios: Dict[str, List[Dict[str, Any]]] = {}
+    if isinstance(data.get("portfolios"), dict):
+        portfolios = _clean_portfolios(data.get("portfolios"), [])
+    if not portfolios and isinstance(data.get("portfolio"), list):
+        portfolio, _, _, _ = parse_imported_data(data)
+        portfolios = {"Main": portfolio}
+    if not portfolios:
+        raise ValueError("Expected a JSON object with portfolios or a portfolio list")
+    watchlists: Dict[str, List[str]] = {}
+    if isinstance(data.get("watchlists"), dict):
+        watchlists = _clean_watchlists(data.get("watchlists"), [])
+    if not watchlists:
+        _, watchlist, _, _ = parse_imported_data({"portfolio": [], "watchlist": data.get("watchlist", []) or []})
+        watchlists = {"Main": watchlist} if watchlist else {"Main": []}
+    _, _, notes, manual = parse_imported_data({"portfolio": [], "watchlist": [], "notes": data.get("notes", {}), "manual": data.get("manual", {})})
+    cash: Dict[str, float] = {}
+    raw_cash = data.get("portfolio_cash", {}) or {}
+    if isinstance(raw_cash, dict):
+        for name, v in raw_cash.items():
+            f = _to_float(v)
+            if isinstance(name, str) and f is not None:
+                cash[name.strip()] = max(0.0, f)
+    return {
+        "portfolios": portfolios, "watchlists": watchlists, "portfolio_cash": cash,
+        "notes": notes, "manual": manual,
+        "scan_presets": data.get("scan_presets", {}) if isinstance(data.get("scan_presets"), dict) else {},
+        "signal_log": data.get("signal_log", []) if isinstance(data.get("signal_log"), list) else [],
+    }
