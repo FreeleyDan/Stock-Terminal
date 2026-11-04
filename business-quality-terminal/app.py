@@ -21,7 +21,7 @@ import io
 import json
 import math
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -33,7 +33,9 @@ from gatekeeper import BIG_FIVE_METRICS, HORIZONS
 from screener import big_five_pass_count, dividend_safety_score, rank_snapshots, scan_snapshots, stepped_rank_snapshots
 from signals import BUY_RANK, PORTFOLIO_RANK, buy_signal, portfolio_signal, sell_signal
 from storage import (
+    ACCOUNT_TYPES,
     MANUAL_SECTOR_OPTIONS,
+    append_sale,
     append_signal_log,
     clear_manual,
     delete_portfolio,
@@ -42,12 +44,14 @@ from storage import (
     load_last_scan,
     load_user_data,
     parse_imported_full,
+    save_account_type,
     save_cash,
     save_last_scan,
     save_manual,
     save_note,
     save_portfolio,
     save_scan_preset,
+    save_tax_rates,
     save_user_data,
     save_watchlist,
 )
@@ -353,6 +357,58 @@ def _format_market_cap(value: Optional[float]) -> str:
     if value >= 1e6:
         return f"${value / 1e6:.2f}M"
     return money(value)
+
+
+def _parse_purchase_date(text: Any) -> Optional[date]:
+    """Parse a YYYY-MM-DD purchase date from the editor, or None."""
+    if text is None or str(text).strip() in ("", "nan", "None"):
+        return None
+    try:
+        return datetime.strptime(str(text).strip()[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _tax_term(purchase_date_str: Optional[str], sale: Optional[date] = None) -> Dict[str, Any]:
+    """Long-term vs short-term for a sale date (default today).
+    Long-term means held MORE than one year: the first long-term-
+    eligible sale date is the one-year anniversary plus one day
+    (e.g. bought 2024-01-01, first LT sale date 2025-01-02).
+    Returns {"term": "Long-term"/"Short-term"/"—", "days_to_lt": int|None,
+             "lt_date": date|None}. Single-lot assumption — see UI note."""
+    purchased = _parse_purchase_date(purchase_date_str)
+    if purchased is None:
+        return {"term": "\u2014", "days_to_lt": None, "lt_date": None}
+    sale_date = sale or datetime.now().date()
+    try:
+        anniversary = purchased.replace(year=purchased.year + 1)
+    except ValueError:
+        anniversary = purchased.replace(year=purchased.year + 1, day=28)
+    lt_date = anniversary + timedelta(days=1)
+    if sale_date >= lt_date:
+        return {"term": "Long-term", "days_to_lt": None, "lt_date": lt_date}
+    return {"term": "Short-term", "days_to_lt": (lt_date - sale_date).days, "lt_date": lt_date}
+
+
+def _estimated_tax(gain: Optional[float], term: str, rates: Dict[str, Any]) -> Optional[float]:
+    """Estimated tax on a sale, using rates the user entered (percent).
+    None if there is no gain, no term, or no rates entered — a loss
+    owes no tax on sale (it may offset other gains), and a missing
+    rate is never guessed. This is an estimate, not a tax calculation."""
+    if gain is None or gain <= 0:
+        return None
+    lt = float(rates.get("lt_pct") or 0.0)
+    st_rate = float(rates.get("st_pct") or 0.0)
+    ca = float(rates.get("ca_pct") or 0.0)
+    if term == "Long-term":
+        if lt <= 0 and ca <= 0:
+            return None
+        return gain * (lt + ca) / 100.0
+    if term == "Short-term":
+        if st_rate <= 0 and ca <= 0:
+            return None
+        return gain * (st_rate + ca) / 100.0
+    return None
 
 
 def _owner_earnings_yield(snap: Dict[str, Any]) -> Optional[float]:
@@ -674,6 +730,7 @@ def clean_portfolio_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
             "ticker": ticker, "shares": _num(r.get("Shares")), "avg_cost": _num(r.get("Avg Cost")),
             "target_pct": max(0.0, min(100.0, target)) if target is not None else None,
             "drip": bool(drip_raw) if drip_raw is not None and str(drip_raw) not in ("", "nan") else False,
+            "purchase_date": _parse_purchase_date(r.get("Purchase Date")).strftime("%Y-%m-%d") if _parse_purchase_date(r.get("Purchase Date")) else None,
         })
     return rows
 
@@ -730,6 +787,38 @@ with tab_portfolio:
     )
     if cash_balance != float((saved_all.get("portfolio_cash") or {}).get(pf_name, 0.0)):
         save_cash(pf_name, cash_balance)
+    # Account type + tax rates. Tax columns, estimates, wash-sale
+    # warnings, and rebalance tax costs appear ONLY for Taxable
+    # portfolios — sales inside an IRA are not taxed at sale, so
+    # showing tax estimates there would be wrong.
+    pf_account_type = (saved_all.get("portfolio_account_types") or {}).get(pf_name, "Not set")
+    if pf_account_type not in ACCOUNT_TYPES:
+        pf_account_type = "Not set"
+    pf_account_type_new = st.selectbox(
+        "Account type — tax features apply only to Taxable portfolios",
+        list(ACCOUNT_TYPES), index=list(ACCOUNT_TYPES).index(pf_account_type), key=f"pf_acct_{pf_name}",
+    )
+    if pf_account_type_new != pf_account_type:
+        save_account_type(pf_name, pf_account_type_new)
+        pf_account_type = pf_account_type_new
+    is_taxable_pf = pf_account_type == "Taxable"
+    with st.expander("Tax settings — your marginal rates (estimates only)", expanded=False):
+        st.caption(
+            "Enter YOUR marginal rates as percentages (e.g. 15 for 15%). These are used only for the "
+            "estimated-tax columns and rebalance tax costs. Leave them at 0 and estimates show —, "
+            "never a guessed rate. Estimates are not tax advice and do not replace your broker's "
+            "1099 or a tax professional — your actual rate depends on total income, filing status, "
+            "and what else you sold that year."
+        )
+        saved_rates = saved_all.get("tax_rates") or {}
+        lt_rate_in = st.number_input("Federal long-term rate (%)", 0.0, 50.0, float(saved_rates.get("lt_pct") or 0.0), key="tax_lt_rate")
+        st_rate_in = st.number_input("Federal short-term rate (%)", 0.0, 50.0, float(saved_rates.get("st_pct") or 0.0), key="tax_st_rate")
+        ca_rate_in = st.number_input("California rate (%)", 0.0, 20.0, float(saved_rates.get("ca_pct") or 0.0), key="tax_ca_rate")
+        tax_rates = {"lt_pct": float(lt_rate_in), "st_pct": float(st_rate_in), "ca_pct": float(ca_rate_in)}
+        if tax_rates != {"lt_pct": float(saved_rates.get("lt_pct") or 0.0), "st_pct": float(saved_rates.get("st_pct") or 0.0), "ca_pct": float(saved_rates.get("ca_pct") or 0.0)}:
+            save_tax_rates(tax_rates["lt_pct"], tax_rates["st_pct"], tax_rates["ca_pct"])
+    if not is_taxable_pf:
+        st.caption("Estimated tax, wash-sale warnings, and rebalance tax costs appear only for Taxable portfolios. Long/short-term status is shown for any portfolio with a purchase date, since holding period is factual — sales inside an IRA are not taxed at sale, so no tax estimate is shown there.")
 
     with st.expander("Import a portfolio file (JSON)", expanded=False):
         st.caption("Import replaces ALL saved portfolios, watchlists, and notes with the file's contents. Export first if you want a backup. Manual dividend data is replaced only if the file contains it — otherwise your existing manual data is kept.")
@@ -761,8 +850,9 @@ with tab_portfolio:
         saved_pf = (load_user_data().get("portfolios") or {}).get(pf_name, [])
         frame = pd.DataFrame(
             [{"Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": h["avg_cost"],
-              "Target %": h.get("target_pct"), "DRIP": bool(h.get("drip"))} for h in saved_pf],
-            columns=["Ticker", "Shares", "Avg Cost", "Target %", "DRIP"],
+              "Target %": h.get("target_pct"), "DRIP": bool(h.get("drip")),
+              "Purchase Date": h.get("purchase_date") or ""} for h in saved_pf],
+            columns=["Ticker", "Shares", "Avg Cost", "Target %", "DRIP", "Purchase Date"],
         )
         frame["Shares"] = pd.to_numeric(frame["Shares"], errors="coerce").astype("float64")
         frame["Avg Cost"] = pd.to_numeric(frame["Avg Cost"], errors="coerce").astype("float64")
@@ -782,8 +872,10 @@ with tab_portfolio:
             "Avg Cost": st.column_config.NumberColumn("Avg Cost", min_value=0.0, format="$%.2f"),
             "Target %": st.column_config.NumberColumn("Target % of account (blank = no target)", min_value=0.0, max_value=100.0),
             "DRIP": st.column_config.CheckboxColumn("DRIP (dividends reinvested)"),
+            "Purchase Date": st.column_config.TextColumn("Purchase Date (YYYY-MM-DD, blank = unknown)"),
         },
     )
+    st.caption("Purchase Date is a single-lot assumption: if you bought a holding in multiple lots at different times, one date cannot split long-term vs short-term per lot. Tax columns below use this date, and only for Taxable portfolios.")
     holdings = clean_portfolio_rows(edited)
     if holdings != st.session_state[pf_saved_key]:
         if save_portfolio(holdings, name=pf_name):
@@ -810,7 +902,7 @@ with tab_portfolio:
                                  "Meaning": "\u2014", "Moat type": "\u2014", "Weight": "\u2014", "Target %": "\u2014", "Drift": "\u2014",
                                  "Div Income/yr": "\u2014",
                                  "Yield on Cost": "\u2014", "Flags": "\u2014", "Mkt Cap": "\u2014", "PEG": "\u2014",
-                                 "Owner Yield": "\u2014", "Data": "\u2014",
+                                 "Owner Yield": "\u2014", "Data": "\u2014", "Tax Term": "\u2014", "Days to LT": "\u2014", "Est Tax": "\u2014",
                                  "Signal": "NO DATA", "Lean": "\u2014", "Why": _short_why(snap["error"]), "_rank": 9, "_value": 0.0, "_moat": 0.0})
                     review_items.append({"Ticker": h["ticker"], "Signal": "NO DATA", "Lean": "\u2014", "Reason": snap["error"], "_urgency": 0})
                     continue
@@ -910,6 +1002,8 @@ with tab_portfolio:
                 elif div_income is not None:
                     projection_excluded.append(h["ticker"])
                 oey_pf = _owner_earnings_yield(snap)
+                tax_info_pf = _tax_term(h.get("purchase_date"))
+                est_tax_pf = _estimated_tax(gain, tax_info_pf["term"], tax_rates) if is_taxable_pf else None
                 rows.append({
                     "Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": money(h["avg_cost"]), "Price": money(price),
                     "Value": money(value), "Gain/Loss": money(gain),
@@ -924,10 +1018,14 @@ with tab_portfolio:
                     "PEG": "\u2014" if peg_pf is None else f"{peg_pf:.2f}",
                     "Owner Yield": "\u2014" if oey_pf is None else f"{oey_pf:.1%}",
                     "Data": f"{comp_pf['metrics']}/5" + (" ⚠️" if comp_pf["metrics"] <= 3 else ""),
+                    "Tax Term": tax_info_pf["term"],
+                    "Days to LT": "\u2014" if tax_info_pf["days_to_lt"] is None else str(tax_info_pf["days_to_lt"]),
+                    "Est Tax": "\u2014" if est_tax_pf is None else money(est_tax_pf),
                     "Signal": sig["signal"], "Lean": lean_pf, "Why": why_short_pf,
                     "_rank": PORTFOLIO_RANK.get(sig["signal"], 9),
                     "_value": value or 0.0, "_moat": snap["moat_score"] or 0.0, "_target": h.get("target_pct"),
                     "_ticker_for_log": h["ticker"], "_price_for_log": price, "_sticker_for_log": val["sticker_price"],
+                    "_gain": gain, "_term": tax_info_pf["term"], "_shares": h["shares"], "_avg_cost": h["avg_cost"],
                 })
         # Weights are % of total account value (holdings + cash), so a
         # cash balance makes weights real instead of holdings-only.
@@ -958,7 +1056,7 @@ with tab_portfolio:
             st.dataframe(pd.DataFrame(review_items).drop(columns=["_urgency"]), hide_index=True, use_container_width=True)
         else:
             st.caption("Review queue: no holdings need attention right now.")
-        df = pd.DataFrame(rows).drop(columns=["_rank", "_value", "_moat", "_target", "_ticker_for_log", "_price_for_log", "_sticker_for_log"])
+        df = pd.DataFrame(rows).drop(columns=["_rank", "_value", "_moat", "_target", "_ticker_for_log", "_price_for_log", "_sticker_for_log", "_gain", "_term", "_shares", "_avg_cost"])
         st.dataframe(style_signal_column(df), hide_index=True, use_container_width=True)
         as_of_pf = _prices_as_of_caption(portfolio_price_dates)
         if as_of_pf:
@@ -1010,6 +1108,133 @@ with tab_portfolio:
         counts = Counter(r["Signal"] for r in rows)
         st.caption(" \u00b7 ".join(f"{n} {s}" for s, n in counts.most_common()))
         _table_downloads(df, f"pf_{pf_name}", f"{pf_name}_portfolio")
+        # Wash-sale watch (Taxable only): a ticker sold at a loss in
+        # the last 30 days that is now held again. This catches only
+        # re-adds recorded here — purchases outside the app are not
+        # known — and it is a risk flag, not a determination. Your
+        # broker's wash-sale reporting and a tax professional govern.
+        if is_taxable_pf:
+            today_w = datetime.now().date()
+            held_tickers = {h["ticker"] for h in holdings}
+            wash_hits = []
+            for entry in (load_user_data().get("sales_log") or []):
+                if entry.get("gain") is None or entry["gain"] >= 0 or entry.get("ticker") not in held_tickers:
+                    continue
+                try:
+                    sale_d = datetime.strptime(entry["date"], "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                if 0 <= (today_w - sale_d).days <= 30:
+                    wash_hits.append(entry)
+            if wash_hits:
+                st.warning(
+                    "Wash-sale risk — sold at a loss in the last 30 days and now held again: "
+                    + ", ".join(f"{e['ticker']} (sold {e['date']}, loss {money(e['gain'])})" for e in wash_hits)
+                    + ". A loss repurchased within 30 days may be disallowed (added to the new shares' basis instead)."
+                )
+        # Record a sale + tax-year summary.
+        with st.expander("Record a sale — and tax-year summary", expanded=False):
+            if "sale_msg" in st.session_state:
+                st.success(st.session_state.pop("sale_msg"))
+            st.caption(
+                "Recording a sale here does not place a trade — it only logs a sale you already made, "
+                "so the tax-year summary and wash-sale watch can use it. It also updates the holding "
+                "(removes it, or reduces shares for a partial sale)."
+            )
+            holdings_map = {h["ticker"]: h for h in holdings}
+            sale_ticker = st.selectbox("Ticker sold", list(holdings_map.keys()), key=f"sale_ticker_{pf_name}")
+            sale_holding = holdings_map.get(sale_ticker, {}) if sale_ticker else {}
+            sale_price_map = {r["Ticker"]: r["_price_for_log"] for r in rows if r.get("_price_for_log")}
+            sale_shares = st.number_input("Shares sold", 0.0, float(sale_holding.get("shares") or 0.0), float(sale_holding.get("shares") or 0.0), key=f"sale_shares_{pf_name}")
+            sale_price = st.number_input("Sale price per share ($)", 0.0, 1e9, float(sale_price_map.get(sale_ticker) or sale_holding.get("avg_cost") or 0.0), key=f"sale_price_{pf_name}")
+            sale_date = st.date_input("Sale date", datetime.now().date(), key=f"sale_date_{pf_name}")
+            purchase_unknown = st.checkbox("Purchase date unknown (term will show —)", key=f"sale_purch_unknown_{pf_name}")
+            default_purch = _parse_purchase_date(sale_holding.get("purchase_date")) or sale_date
+            sale_purch_date = None if purchase_unknown else st.date_input("Purchase date", default_purch, key=f"sale_purch_{pf_name}")
+            if st.button("Record sale", key=f"sale_btn_{pf_name}"):
+                if not sale_ticker or sale_shares <= 0 or sale_price <= 0:
+                    st.warning("Enter a ticker, shares sold, and sale price.")
+                elif sale_holding.get("shares") and sale_shares > sale_holding["shares"]:
+                    st.warning("Shares sold cannot exceed shares held.")
+                else:
+                    avg_c = sale_holding.get("avg_cost") or 0.0
+                    sale_gain = (sale_price - avg_c) * sale_shares
+                    sale_term = _tax_term(sale_purch_date.strftime("%Y-%m-%d") if sale_purch_date else None, sale_date)["term"]
+                    if append_sale({
+                        "date": sale_date.strftime("%Y-%m-%d"), "ticker": sale_ticker, "portfolio": pf_name,
+                        "shares": sale_shares, "sale_price": sale_price, "avg_cost": avg_c, "gain": sale_gain,
+                        "term": sale_term, "purchase_date": sale_purch_date.strftime("%Y-%m-%d") if sale_purch_date else None,
+                    }):
+                        new_holdings = []
+                        for h in holdings:
+                            if h["ticker"] != sale_ticker:
+                                new_holdings.append(h)
+                            elif sale_holding.get("shares") and sale_shares < sale_holding["shares"]:
+                                nh = dict(h)
+                                nh["shares"] = sale_holding["shares"] - sale_shares
+                                new_holdings.append(nh)
+                        save_portfolio(new_holdings, name=pf_name)
+                        st.session_state.pop(pf_df_key, None)
+                        st.session_state.pop(pf_saved_key, None)
+                        st.session_state["sale_msg"] = f"Recorded sale: {sale_ticker} {sale_shares:g} shares at {money(sale_price)} — gain/loss {money(sale_gain)} ({sale_term})."
+                        st.rerun()
+                    else:
+                        st.error("Could not save the sale.")
+            st.markdown("**Tax-year summary — from sales recorded here only**")
+            st.caption("This is not a 1099: it covers only sales you recorded in this app, not sales outside it. Losses may offset gains; the general $3,000/year limit on net losses against ordinary income and carryforward rules are outside this summary — check with a tax professional.")
+            all_sales = load_user_data().get("sales_log") or []
+            sale_pf_options = ["All portfolios"] + sorted({e.get("portfolio") or "" for e in all_sales if e.get("portfolio")})
+            sale_pf_filter = st.selectbox("Portfolio filter", sale_pf_options, key=f"sale_filter_{pf_name}")
+            filtered_sales = [e for e in all_sales if sale_pf_filter == "All portfolios" or e.get("portfolio") == sale_pf_filter]
+            if not filtered_sales:
+                st.caption("No sales recorded yet.")
+            else:
+                summary_rows = []
+                for year in sorted({e["date"][:4] for e in filtered_sales}):
+                    year_sales = [e for e in filtered_sales if e["date"][:4] == year]
+                    lt_sum = sum(e["gain"] for e in year_sales if e.get("term") == "Long-term" and e.get("gain") is not None)
+                    st_sum = sum(e["gain"] for e in year_sales if e.get("term") == "Short-term" and e.get("gain") is not None)
+                    other_sum = sum(e["gain"] for e in year_sales if e.get("term") not in ("Long-term", "Short-term") and e.get("gain") is not None)
+                    summary_rows.append({"Year": year, "Long-term gain/loss": money(lt_sum), "Short-term gain/loss": money(st_sum), "Unknown-term gain/loss": money(other_sum), "Net": money(lt_sum + st_sum + other_sum), "Sales": len(year_sales)})
+                st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(filtered_sales[::-1]), hide_index=True, use_container_width=True)
+                st.download_button(
+                    "Download sales log (CSV)", data=pd.DataFrame(filtered_sales).to_csv(index=False),
+                    file_name="sales_log.csv", mime="text/csv", key=f"sale_log_csv_{pf_name}",
+                )
+        # Tax-aware rebalance trades: only holdings with a target set.
+        with st.expander("Rebalance trades — to reach your target weights", expanded=False):
+            st.caption(
+                "Trades at current prices to reach the Target % values in the editor. Prices move, so these are "
+                "indicative, not orders. For Taxable portfolios, sell trades show estimated tax cost (from your "
+                "rates and the holding's term); for other account types that column is —. Estimates only."
+            )
+            rebalance_rows = []
+            targeted_value = 0.0
+            for r in rows:
+                if r.get("_target") is None or not r.get("_price_for_log"):
+                    continue
+                target_value = r["_target"] / 100.0 * total_account
+                targeted_value += target_value
+                trade_value = target_value - r["_value"]
+                trade_shares = trade_value / r["_price_for_log"] if r["_price_for_log"] else None
+                est_tax_cost = None
+                if trade_value < 0 and is_taxable_pf and r.get("_avg_cost") and r["_price_for_log"] > r["_avg_cost"]:
+                    gain_sold = (r["_price_for_log"] - r["_avg_cost"]) * abs(trade_shares) if trade_shares else 0.0
+                    est_tax_cost = _estimated_tax(gain_sold, r.get("_term", "\u2014"), tax_rates)
+                rebalance_rows.append({
+                    "Ticker": r["Ticker"], "Current Value": money(r["_value"]),
+                    "Target %": f"{r['_target']:.1f}%", "Target Value": money(target_value),
+                    "Trade $": money(trade_value),
+                    "Trade Shares": "\u2014" if trade_shares is None else f"{trade_shares:+.2f} ({'Buy' if trade_shares > 0 else 'Sell'})",
+                    "Est Tax Cost": "\u2014" if est_tax_cost is None else money(est_tax_cost),
+                })
+            if not rebalance_rows:
+                st.caption("No holdings have a Target % set yet — set one in the editor above.")
+            else:
+                st.dataframe(pd.DataFrame(rebalance_rows), hide_index=True, use_container_width=True)
+                unallocated_pct = 100.0 - sum(r["_target"] for r in rows if r.get("_target") is not None)
+                st.caption(f"Unallocated (cash + untargeted holdings): {unallocated_pct:.1f}% / {money(total_account - targeted_value)}. Targets need not sum to 100%.")
         # Signal log: what past signals said, and what prices did after.
         with st.expander("Signal log — past signals and what prices did after", expanded=False):
             signal_log = (load_user_data().get("signal_log") or [])
@@ -1173,6 +1398,26 @@ with tab_watchlist:
         _table_downloads(df, f"wl_{wl_name}", f"{wl_name}_watchlist")
         counts = Counter(r["Signal"] for r in rows)
         st.caption(" \u00b7 ".join(f"{n} {s}" for s, n in counts.most_common()))
+        # Wash-sale watch for watchlist tickers too: if you buy a
+        # ticker in a taxable account within 30 days of selling it at
+        # a loss, the loss may be disallowed.
+        today_wl = datetime.now().date()
+        wl_wash = []
+        for entry in (load_user_data().get("sales_log") or []):
+            if entry.get("gain") is None or entry["gain"] >= 0 or entry.get("ticker") not in watch:
+                continue
+            try:
+                sale_d_wl = datetime.strptime(entry["date"], "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if 0 <= (today_wl - sale_d_wl).days <= 30:
+                wl_wash.append(entry)
+        if wl_wash:
+            st.warning(
+                "Wash-sale risk on this watchlist — sold at a loss in the last 30 days: "
+                + ", ".join(f"{e['ticker']} (sold {e['date']})" for e in wl_wash)
+                + ". Buying it in a taxable account within 30 days of that sale may disallow the loss."
+            )
 
 
 # --- 4 & 5. Market scanner --------------------------------------------------
