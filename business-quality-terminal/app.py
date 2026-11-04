@@ -28,7 +28,8 @@ import pandas as pd
 import streamlit as st
 
 from calculations import calculate_ddm_value, calculate_sticker_price
-from data_fetcher import clear_cache, normalize_ticker
+from data_fetcher import _build_financial_history, clear_cache, fetch_raw_companyfacts, normalize_ticker
+from holdings import NON_13F, check_holdings
 from gatekeeper import BIG_FIVE_METRICS, HORIZONS
 from screener import big_five_pass_count, dividend_safety_score, rank_snapshots, scan_snapshots, stepped_rank_snapshots
 from signals import BUY_RANK, PORTFOLIO_RANK, buy_signal, portfolio_signal, sell_signal
@@ -425,6 +426,58 @@ def _owner_earnings_yield(snap: Dict[str, Any]) -> Optional[float]:
         return None
 
 
+def _crosscheck_normalized(snap: Dict[str, Any], val: Optional[Dict[str, Any]], discount_rate: float) -> Dict[str, Any]:
+    """Eye-check only: normalized owner-earnings sticker + ROIC level.
+
+    Base = mean owner earnings per share across the snapshot's
+    available horizons (0/1/3/5 years ago), where OE/share =
+    total owner earnings (from companyfacts, split-invariant totals)
+    divided by the snapshot's split-adjusted shares at that horizon.
+    Growth and historical P/E are the main valuation's, so only the
+    base changes — this is a cross-check, not a second valuation
+    system, and it never feeds a signal, a Top 25 rank, or MOS.
+    Returns {'error': ...} when the history is not available. The
+    companyfacts fetch happens only when the user clicks the
+    cross-check button, never on every Lookup render.
+    """
+    try:
+        raw, status = fetch_raw_companyfacts(snap["ticker"])
+        if raw is None:
+            return {"error": "Couldn't reach SEC EDGAR for the cross-check"}
+        hist = _build_financial_history(raw)
+        oe_total = hist.get("_owner_earnings_history") or {}
+        roic = hist.get("ROIC") or {}
+        shares = snap.get("shares_history") or {}
+        oe_ps: Dict[Any, float] = {}
+        for horizon, total in oe_total.items():
+            sh = shares.get(horizon)
+            if sh:
+                try:
+                    oe_ps[horizon] = float(total) / float(sh)
+                except Exception:
+                    continue
+        recent = [oe_ps[h] for h in (0, 1, 3, 5) if h in oe_ps and oe_ps[h] is not None]
+        if len(recent) < 2:
+            return {"error": "Not enough owner-earnings history for a normalized base"}
+        base = sum(recent) / len(recent)
+        if base is None or base <= 0:
+            return {"error": "Normalized owner earnings are not positive"}
+        growth = (val or {}).get("growth_used") or snap.get("growth_rate")
+        pe = snap.get("historical_pe")
+        sticker = calculate_sticker_price(base, growth, pe, discount_rate) if growth and pe else None
+        roic_recent = [roic[h] for h in (0, 1, 3, 5) if h in roic and roic[h] is not None]
+        roic_mean = (sum(roic_recent) / len(roic_recent)) if roic_recent else None
+        roic_latest = roic.get(0)
+        return {
+            "base_oe_ps": base, "oe_ps_by_horizon": {str(k): v for k, v in oe_ps.items()},
+            "sticker": sticker, "mos": sticker * 0.5 if sticker else None,
+            "growth_used": growth, "roic_mean": roic_mean, "roic_latest": roic_latest,
+            "roic_ok": bool(roic_mean is not None and roic_mean >= 0.15 and roic_latest is not None and roic_latest >= 0.10),
+        }
+    except Exception:
+        return {"error": "Cross-check couldn't be computed from SEC data"}
+
+
 def _short_why(text: str, limit: int = 100) -> str:
     """Table cells must stay short — long Why text runs off the page
     and cannot be scrolled to on some clients. The full reasons live in
@@ -657,6 +710,63 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
                 st.success(f"Notes saved for {ticker}.")
             else:
                 st.warning("Couldn't save notes — they won't persist after a restart on Cloud. Use the Portfolio export as a backup.")
+
+    # Cross-checks — eye check only. Nothing here changes the main
+    # Sticker Price, MOS, Top 25 ranking, or any BUY/SELL signal.
+    with st.expander("Cross-checks — eye check only (normalized sticker + ROIC level)", expanded=False):
+        st.caption(
+            "The normalized sticker reuses the main growth rate and historical P/E and only changes the earnings base "
+            "to mean owner earnings per share across recent horizons. It is rougher than backtest v6's annual mean "
+            "(the snapshot gives horizons, not every year), so treat a disagreement as a prompt to look closer, not as a new valuation."
+        )
+        if st.button("Compute cross-checks", key=f"cross_{ticker}"):
+            st.session_state.setdefault("crosscheck", {})[ticker] = _crosscheck_normalized(snap, val, discount_rate)
+        cross = (st.session_state.get("crosscheck") or {}).get(ticker)
+        if cross:
+            if cross.get("error"):
+                st.warning(cross["error"])
+            else:
+                st.write(f"Normalized owner earnings/share (mean of recent horizons): {money(cross['base_oe_ps'])}")
+                st.write(f"Cross-check Sticker: {money(cross['sticker'])} — MOS: {money(cross['mos'])} (main Sticker: {money(sticker)})")
+                if cross.get("roic_mean") is not None:
+                    st.write(
+                        f"ROIC level: mean {cross['roic_mean']:.1%}, latest {cross['roic_latest']:.1%}" if cross.get("roic_latest") is not None else f"ROIC level: mean {cross['roic_mean']:.1%}"
+                        + (" — meets the v6 ROIC-level bar (mean ≥15%, latest ≥10%)" if cross.get("roic_ok") else " — below the v6 ROIC-level bar")
+                    )
+                else:
+                    st.write("ROIC level: — (not in SEC history)")
+
+    # Value-investor holdings — eye check only, from SEC filings.
+    with st.expander("Value-investor holdings — eye check only (SEC 13F, lagged)", expanded=False):
+        st.caption(
+            "13F is quarterly and due up to 45 days after quarter-end, so holdings can be ~4 months old; shorts, cash, "
+            "bonds, and non-US positions are excluded. Matching is by issuer name, not CUSIP — class shares "
+            "(e.g. GOOG vs GOOGL) are flagged ambiguous instead of guessed. A holding here is never a buy signal."
+        )
+        if st.button("Check latest 13F holdings", key=f"holdings_{ticker}"):
+            st.session_state.setdefault("holdings_check", {})[ticker] = check_holdings(ticker, snap.get("name"))
+        held = (st.session_state.get("holdings_check") or {}).get(ticker)
+        if held:
+            rows_h = []
+            for r in held:
+                if r.get("error"):
+                    rows_h.append({"Investor": r["person"], "Manager": r["manager"], "Holds?": "— (fetch failed)", "Shares": "—", "Value": "—", "% of 13F portfolio": "—", "Report date": r.get("report_date") or "—", "Filing date": r.get("filing_date") or "—", "Issuer as filed": r["error"]})
+                elif not r["holds"]:
+                    rows_h.append({"Investor": r["person"], "Manager": r["manager"], "Holds?": "No (by name)", "Shares": "—", "Value": "—", "% of 13F portfolio": "—", "Report date": r.get("report_date") or "—", "Filing date": r.get("filing_date") or "—", "Issuer as filed": "—"})
+                else:
+                    for m in r["matches"]:
+                        rows_h.append({
+                            "Investor": r["person"], "Manager": r["manager"],
+                            "Holds?": "Yes — class ambiguous, check CUSIP" if r["ambiguous"] else "Yes",
+                            "Shares": f"{m['shares']:,}", "Value": money(m["value"]),
+                            " % of 13F portfolio".strip(): f"{m['pct_portfolio']:.1%}" if m.get("pct_portfolio") is not None else "—",
+                            "Report date": r.get("report_date") or "—", "Filing date": r.get("filing_date") or "—",
+                            "Issuer as filed": f"{m['issuer']} (CUSIP {m['cusip']})",
+                        })
+            st.dataframe(pd.DataFrame(rows_h), hide_index=True, use_container_width=True)
+        for nf in NON_13F:
+            st.caption(f"{nf['person']}: {nf['note']}")
+        st.caption("Phil Town's Rule One Fund (RULRX) files N-PORT, not 13F — that check is a separate build and is not in this table yet.")
     st.divider()
 
 
