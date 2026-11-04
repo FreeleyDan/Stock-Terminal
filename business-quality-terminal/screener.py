@@ -22,6 +22,148 @@ from gatekeeper import BIG_FIVE_METRICS
 from valuation import TRANSIENT, build_snapshot, valuation_from_snapshot
 
 
+def dividend_safety_score(
+    payout_ratio: Optional[float],
+    fcf_dividend_coverage: Optional[float],
+    debt_ratio: Optional[float],
+    dividend_streak: Optional[int],
+    dividend_growth_5yr: Optional[float],
+    big_five_passes: Optional[int],
+) -> Dict[str, Any]:
+    """
+    Stock Terminal Dividend Safety Score — our own score, NOT Simply
+    Safe Dividends' score. Transparent, backward-looking only, built
+    from SEC/Yahoo data the app already collects.
+
+    Components (100 total):
+    - Payout & coverage, 25: payout tier and FCF-cover tier, limited by
+      the weaker of the two (a great payout with weak FCF cover is not
+      safe, and vice versa). If only one is known, that one stands.
+    - Balance sheet, 20: long-term debt / owner earnings.
+    - Dividend history, 20: consecutive years of dividend increases.
+    - Dividend growth, 20: 5-year dividend growth rate.
+    - Earnings/FCF quality, 15: Big Five passes at the 10% hurdle.
+
+    Missing data scores 0 for that component and is listed in
+    "missing" — unknown is never treated as safe. Bands: 80-100 Very
+    Safe, 60-79 Safe, 40-59 Borderline, 20-39 Unsafe, 0-19 Very Unsafe.
+    Utilities/REITs legitimately pay out more, so a high payout alone
+    will score them lower — that is a known limit, not a data error.
+    """
+    def _payout_tier(p: Optional[float]) -> Optional[int]:
+        if p is None:
+            return None
+        if p <= 0.50:
+            return 25
+        if p <= 0.65:
+            return 18
+        if p <= 0.80:
+            return 8
+        return 0
+
+    def _fcf_tier(c: Optional[float]) -> Optional[int]:
+        if c is None:
+            return None
+        if c >= 1.5:
+            return 25
+        if c >= 1.0:
+            return 18
+        if c >= 0.5:
+            return 8
+        return 0
+
+    missing: List[str] = []
+    payout_tier = _payout_tier(payout_ratio)
+    fcf_tier = _fcf_tier(fcf_dividend_coverage)
+    if payout_tier is None and fcf_tier is None:
+        payout_component = 0
+        missing.append("payout / FCF coverage")
+    elif payout_tier is None:
+        payout_component = fcf_tier  # type: ignore[assignment]
+        missing.append("payout ratio")
+    elif fcf_tier is None:
+        payout_component = payout_tier
+        missing.append("FCF coverage")
+    else:
+        payout_component = min(payout_tier, fcf_tier)
+
+    if debt_ratio is None:
+        balance_component = 0
+        missing.append("debt ratio")
+    elif debt_ratio <= 1.0:
+        balance_component = 20
+    elif debt_ratio <= 2.0:
+        balance_component = 15
+    elif debt_ratio <= 3.0:
+        balance_component = 10
+    else:
+        balance_component = 0
+
+    if dividend_streak is None:
+        history_component = 0
+        missing.append("dividend streak")
+    elif dividend_streak >= 25:
+        history_component = 20
+    elif dividend_streak >= 15:
+        history_component = 17
+    elif dividend_streak >= 10:
+        history_component = 14
+    elif dividend_streak >= 5:
+        history_component = 10
+    elif dividend_streak >= 1:
+        history_component = 5
+    else:
+        history_component = 0
+
+    if dividend_growth_5yr is None:
+        growth_component = 0
+        missing.append("5yr dividend growth")
+    elif dividend_growth_5yr >= 0.08:
+        growth_component = 20
+    elif dividend_growth_5yr >= 0.04:
+        growth_component = 14
+    elif dividend_growth_5yr >= 0:
+        growth_component = 7
+    else:
+        growth_component = 0
+
+    if big_five_passes is None:
+        quality_component = 0
+        missing.append("Big Five passes")
+    elif big_five_passes >= 4:
+        quality_component = 15
+    elif big_five_passes == 3:
+        quality_component = 10
+    elif big_five_passes == 2:
+        quality_component = 5
+    else:
+        quality_component = 0
+
+    total = payout_component + balance_component + history_component + growth_component + quality_component
+    if total >= 80:
+        band = "Very Safe"
+    elif total >= 60:
+        band = "Safe"
+    elif total >= 40:
+        band = "Borderline"
+    elif total >= 20:
+        band = "Unsafe"
+    else:
+        band = "Very Unsafe"
+    return {
+        "score": total,
+        "band": band,
+        "components": {
+            "payout_coverage": payout_component,
+            "balance_sheet": balance_component,
+            "dividend_history": history_component,
+            "dividend_growth": growth_component,
+            "earnings_quality": quality_component,
+        },
+        "missing": missing,
+    }
+
+
 def big_five_pass_count(snapshot: Dict[str, Any], hurdle: float) -> int:
     """How many of the Big Five pass at `hurdle`, using stored CAGRs.
 

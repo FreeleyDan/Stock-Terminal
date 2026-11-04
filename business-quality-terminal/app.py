@@ -18,6 +18,7 @@ Run with:  streamlit run app.py
 from __future__ import annotations
 
 import json
+import math
 from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -27,13 +28,15 @@ import streamlit as st
 
 from data_fetcher import clear_cache, normalize_ticker
 from gatekeeper import BIG_FIVE_METRICS, HORIZONS
-from screener import rank_snapshots, scan_snapshots, stepped_rank_snapshots
+from screener import big_five_pass_count, dividend_safety_score, rank_snapshots, scan_snapshots, stepped_rank_snapshots
 from signals import BUY_RANK, PORTFOLIO_RANK, buy_signal, portfolio_signal, sell_signal
 from storage import (
+    clear_manual,
     load_last_scan,
     load_user_data,
     parse_imported_data,
     save_last_scan,
+    save_manual,
     save_note,
     save_portfolio,
     save_user_data,
@@ -182,6 +185,63 @@ def _notes_for(ticker: str) -> Dict[str, Any]:
         return (load_user_data().get("notes") or {}).get(normalize_ticker(ticker), {}) or {}
     except Exception:
         return {}
+
+
+def _manual_for(ticker: str) -> Dict[str, Any]:
+    """Manual dividend data for a ticker, or {} — never raises."""
+    try:
+        return (load_user_data().get("manual") or {}).get(normalize_ticker(ticker), {}) or {}
+    except Exception:
+        return {}
+
+
+def _apply_manual_to_snapshot(snap: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return a copy of a snapshot with the user's manual dividend fields
+    applied. Manual fields are tracked separately in the copy as
+    "manual_fields" (a list of field names) so the table can flag them
+    with ✏️. The original session-state scan is never mutated.
+    """
+    manual = _manual_for(snap.get("ticker", ""))
+    if not manual:
+        out = dict(snap)
+        out["manual_fields"] = []
+        return out
+    out = dict(snap)
+    out["manual_fields"] = sorted(manual.keys())
+    price = out.get("current_price")
+    eps = out.get("current_eps")
+    if "dividend_per_share" in manual:
+        out["dividend_per_share"] = manual["dividend_per_share"]
+        if price:
+            out["dividend_yield"] = manual["dividend_per_share"] / price
+        if "payout_ratio" not in manual and eps:
+            out["payout_ratio"] = manual["dividend_per_share"] / eps
+    if "payout_ratio" in manual:
+        out["payout_ratio"] = manual["payout_ratio"]
+    if "dividend_growth_5yr" in manual:
+        out["dividend_growth_5yr"] = manual["dividend_growth_5yr"]
+    if "dividend_streak" in manual:
+        out["dividend_streak"] = manual["dividend_streak"]
+    if "fcf_dividend_coverage" in manual:
+        out["fcf_dividend_coverage"] = manual["fcf_dividend_coverage"]
+    if "debt_ratio" in manual:
+        out["debt_ratio_manual"] = manual["debt_ratio"]
+    # Recompute Chowder / 10-by-10 from the (possibly manual) inputs.
+    yld = out.get("dividend_yield")
+    dgr = out.get("dividend_growth_5yr")
+    if yld is not None and dgr is not None:
+        out["chowder"] = yld + dgr
+        if yld >= 0.10:
+            out["years_to_10pct_yield_on_cost"] = 0.0
+        elif dgr > 0:
+            out["years_to_10pct_yield_on_cost"] = math.log(0.10 / yld) / math.log(1.0 + dgr)
+    return out
+
+
+def _manual_label(manual_fields: List[str], field: str) -> str:
+    """' ✏️' if this field was entered manually, else ''."""
+    return " ✏️" if field in (manual_fields or []) else ""
 
 
 def build_checklist_dataframe(gatekeeper: Dict[str, Any]) -> pd.DataFrame:
@@ -382,12 +442,13 @@ with tab_portfolio:
         near_buy_pct_pf = st.slider("'Near buy' band: within X% above the buy price", 0, 50, 15, key="pf_near")
 
     with st.expander("Import a portfolio file (JSON)", expanded=False):
-        st.caption("Import replaces the saved portfolio, watchlist, and notes with the file's contents. Export first if you want a backup.")
+        st.caption("Import replaces the saved portfolio, watchlist, and notes with the file's contents. Export first if you want a backup. Manual dividend data is replaced only if the file contains it — otherwise your existing manual data is kept.")
         uploaded_pf = st.file_uploader("Portfolio JSON file", type=["json"], key="pf_import_file")
         if uploaded_pf is not None and st.button("Import this file", key="pf_import_btn"):
             try:
-                imported_portfolio, imported_watchlist, imported_notes = parse_imported_data(json.load(uploaded_pf))
-                save_user_data({"portfolio": imported_portfolio, "watchlist": imported_watchlist, "notes": imported_notes})
+                imported_portfolio, imported_watchlist, imported_notes, imported_manual = parse_imported_data(json.load(uploaded_pf))
+                existing_manual = (load_user_data().get("manual") or {}) if not imported_manual else imported_manual
+                save_user_data({"portfolio": imported_portfolio, "watchlist": imported_watchlist, "notes": imported_notes, "manual": existing_manual})
                 frame_imported = pd.DataFrame(
                     [{"Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": h["avg_cost"]} for h in imported_portfolio],
                     columns=["Ticker", "Shares", "Avg Cost"],
@@ -560,6 +621,9 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
     # so unknown is not treated as failing.
     snapshots_for_rank = scan["snapshots"]
     if dividend_mode:
+        # Apply manual dividend data first, so manual values count for
+        # filters, Chowder, and the safety score — and are flagged ✏️.
+        snapshots_for_rank = [_apply_manual_to_snapshot(s) for s in snapshots_for_rank]
         filtered = []
         for snap in snapshots_for_rank:
             if snap.get("error"):
@@ -605,7 +669,11 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
             "8%+ favored), and 10-by-10 = years for yield-on-cost to reach 10%. Van Knapp's full Quality Snapshots "
             "score uses paid data (Value Line, Morningstar moat, S&P ratings, Simply Safe Dividends) that SEC filings "
             "don't carry, so this tab uses the app's Moat Score / Debt Test / free-cash-flow checks as its quality proxy, "
-            "not his exact score. Stocks with a missing dividend metric show \u2014 and are not excluded for it."
+            "not his exact score. Stocks with a missing dividend metric show \u2014 and are not excluded for it. "
+            "Safety Score is the app's own 0–100 score (payout/FCF cover 25, balance sheet 20, dividend history 20, "
+            "dividend growth 20, earnings quality 15; 80+ Very Safe, 60+ Safe, 40+ Borderline, 20+ Unsafe). "
+            "A * on the Safety Score means a component scored 0 for missing data, not necessarily for risk — check the "
+            "Manual column. Any cell with \u270f\ufe0f is a manual value you entered, not pulled data."
         )
     if scan.get("aborted"):
         st.warning(scan["aborted"])
@@ -641,15 +709,35 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
                 else:
                     div_flag = "\u2014"
                 years_to_10 = r.get("years_to_10pct_yield_on_cost")
+                # Safety score from the (manual-applied) snapshot, with
+                # Big Five passes measured at a fixed 10% hurdle — not
+                # the stepped hurdle used for ranking — so the score
+                # doesn't inflate when the hurdle steps down.
+                snap_for_score = {s.get("ticker"): s for s in snapshots_for_rank}.get(r["ticker"], {})
+                manual_fields = snap_for_score.get("manual_fields", []) or []
+                debt_ratio = snap_for_score.get("debt_ratio_manual")
+                if debt_ratio is None:
+                    debt_ratio = ((snap_for_score.get("gatekeeper") or {}).get("debt_test") or {}).get("ratio")
+                try:
+                    bf_passes_10 = big_five_pass_count(snap_for_score, 0.10) if snap_for_score else None
+                except Exception:
+                    bf_passes_10 = None
+                safety = dividend_safety_score(
+                    payout, fcf_cover, debt_ratio, r.get("dividend_streak"), r.get("dividend_growth_5yr"), bf_passes_10
+                )
+                chowder_label = _manual_label(manual_fields, "dividend_growth_5yr") or _manual_label(manual_fields, "dividend_per_share")
+                row["Div. Streak (yrs)"] = f"{r['dividend_streak']}{_manual_label(manual_fields, 'dividend_streak')}"
                 row.update(
                     {
-                        "Yield": _pct_or_dash(r.get("dividend_yield")),
-                        "Div Growth 5yr": _pct_or_dash(r.get("dividend_growth_5yr")),
-                        "Chowder": _pct_or_dash(r.get("chowder")),
-                        "Payout": _pct_or_dash(payout),
-                        "FCF Cover": "\u2014" if fcf_cover is None else f"{fcf_cover:.1f}x",
+                        "Yield": _pct_or_dash(r.get("dividend_yield")) + _manual_label(manual_fields, "dividend_per_share"),
+                        "Div Growth 5yr": _pct_or_dash(r.get("dividend_growth_5yr")) + _manual_label(manual_fields, "dividend_growth_5yr"),
+                        "Chowder": _pct_or_dash(r.get("chowder")) + chowder_label,
+                        "Payout": _pct_or_dash(payout) + _manual_label(manual_fields, "payout_ratio"),
+                        "FCF Cover": ("\u2014" if fcf_cover is None else f"{fcf_cover:.1f}x") + _manual_label(manual_fields, "fcf_dividend_coverage"),
                         "Yrs to 10% YoC": "\u2014" if years_to_10 is None else ("Already \u226510%" if years_to_10 == 0 else f"{years_to_10:.0f} yrs"),
                         "Div. flag": div_flag,
+                        "Safety Score": f"{safety['score']} {safety['band']}" + (" *" if safety["missing"] else ""),
+                        "Manual": "\u270f\ufe0f " + ", ".join(manual_fields) if manual_fields else "\u2014",
                     }
                 )
             rows.append(row)
@@ -744,6 +832,80 @@ with tab_dividends:
         "Wonderful businesses first (same hurdle step-down as the Undervalued tab)",
         value=True, key="div_quality_first",
     )
+    with st.expander("\u270f\ufe0f Manual dividend data — fill in a field the SEC pull missed"):
+        st.caption(
+            "Use this when a metric shows \u2014 in the table but you found it yourself (annual report, company "
+            "investor page, broker). Leave a field blank to keep the pulled value. Anything you enter here is "
+            "flagged \u270f\ufe0f in the table and counts for the filters and the Safety Score — it is never shown "
+            "as pulled data. Manual data is saved with your portfolio export/import, so back it up the same way."
+        )
+        manual_ticker = st.text_input("Ticker", key="manual_ticker").strip().upper()
+        existing_manual = _manual_for(manual_ticker) if manual_ticker else {}
+        if existing_manual:
+            st.caption(f"Already saved for {manual_ticker}: " + ", ".join(f"{k}={v}" for k, v in existing_manual.items()))
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            manual_dps = st.text_input("Dividend per share, latest annual ($)", key="manual_dps", placeholder="e.g. 1.61")
+            manual_payout = st.text_input("Payout ratio (%)", key="manual_payout", placeholder="e.g. 54 for 54%")
+            manual_growth = st.text_input("5-year dividend growth (%)", key="manual_growth", placeholder="e.g. 10 for 10%")
+        with col_m2:
+            manual_streak = st.text_input("Consecutive years of dividend increases", key="manual_streak", placeholder="e.g. 12")
+            manual_fcf = st.text_input("FCF dividend coverage (x)", key="manual_fcf", placeholder="e.g. 1.8")
+            manual_debt = st.text_input("Debt ratio — LT debt / owner earnings (x)", key="manual_debt", placeholder="e.g. 1.5")
+
+        def _parse_manual_pct(text: str) -> Optional[float]:
+            try:
+                return float(text) / 100.0
+            except (TypeError, ValueError):
+                return None
+
+        def _parse_manual_num(text: str) -> Optional[float]:
+            try:
+                return float(text)
+            except (TypeError, ValueError):
+                return None
+
+        if st.button("Save manual dividend data", key="manual_save_btn"):
+            if not manual_ticker:
+                st.warning("Enter a ticker first.")
+            else:
+                fields: Dict[str, Any] = {}
+                if manual_dps.strip():
+                    v = _parse_manual_num(manual_dps)
+                    if v is not None:
+                        fields["dividend_per_share"] = v
+                if manual_payout.strip():
+                    v = _parse_manual_pct(manual_payout)
+                    if v is not None:
+                        fields["payout_ratio"] = v
+                if manual_growth.strip():
+                    v = _parse_manual_pct(manual_growth)
+                    if v is not None:
+                        fields["dividend_growth_5yr"] = v
+                if manual_streak.strip():
+                    try:
+                        fields["dividend_streak"] = int(manual_streak)
+                    except ValueError:
+                        pass
+                if manual_fcf.strip():
+                    v = _parse_manual_num(manual_fcf)
+                    if v is not None:
+                        fields["fcf_dividend_coverage"] = v
+                if manual_debt.strip():
+                    v = _parse_manual_num(manual_debt)
+                    if v is not None:
+                        fields["debt_ratio"] = v
+                if not fields:
+                    st.warning("No valid numbers entered — nothing saved.")
+                elif save_manual(manual_ticker, fields):
+                    st.success(f"Saved manual data for {manual_ticker} — it will show \u270f\ufe0f in the table. Re-run or refresh the table to see it.")
+                else:
+                    st.error("Couldn't save manual data.")
+        if st.button("Clear manual data for this ticker", key="manual_clear_btn"):
+            if manual_ticker and clear_manual(manual_ticker):
+                st.success(f"Cleared manual data for {manual_ticker}.")
+            else:
+                st.warning("Enter a ticker with saved manual data first.")
     if "scan" in st.session_state:
         render_ranked_table(
             st.session_state["scan"], int(div_years), float(min_moat_div), quality_first=quality_first_div,

@@ -27,9 +27,49 @@ SCAN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_scan.
 
 NOTE_FIELDS = ("meaning", "management", "moat_type", "thesis", "sell_trigger")
 
+# Manual dividend data the user fills in when SEC filings don't carry a
+# field. Stored per ticker, and ALWAYS flagged as manual in the UI (✏️) —
+# manual values never pretend to be pulled data. Only these fields can
+# be set manually, and only in the dividend tab.
+MANUAL_FIELDS = (
+    "dividend_per_share",  # $ per share, latest annual
+    "payout_ratio",  # decimal, e.g. 0.54 for 54%
+    "dividend_growth_5yr",  # decimal CAGR, e.g. 0.10 for 10%
+    "dividend_streak",  # int, consecutive years of dividend increases
+    "fcf_dividend_coverage",  # x, free cash flow per share / DPS
+    "debt_ratio",  # x, long-term debt / owner earnings
+)
+
 
 def _empty() -> Dict[str, Any]:
-    return {"portfolio": [], "watchlist": [], "notes": {}}
+    return {"portfolio": [], "watchlist": [], "notes": {}, "manual": {}}
+
+
+def _clean_manual(raw_manual: Any) -> Dict[str, Any]:
+    """Validate manual entries: known fields only, numeric, streak as int."""
+    manual: Dict[str, Any] = {}
+    if not isinstance(raw_manual, dict):
+        return manual
+    for ticker, entry in raw_manual.items():
+        clean_ticker = normalize_ticker(ticker or "")
+        if not clean_ticker or not isinstance(entry, dict):
+            continue
+        clean: Dict[str, Any] = {}
+        for k in MANUAL_FIELDS:
+            if k not in entry or entry.get(k) is None or entry.get(k) == "":
+                continue
+            if k == "dividend_streak":
+                try:
+                    clean[k] = int(entry[k])
+                except (TypeError, ValueError):
+                    continue
+            else:
+                v = _to_float(entry.get(k))
+                if v is not None:
+                    clean[k] = v
+        if clean:
+            manual[clean_ticker] = clean
+    return manual
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -82,7 +122,7 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
                     notes[clean_ticker][k] = int(notes[clean_ticker][k])
                 except (TypeError, ValueError):
                     notes[clean_ticker][k] = ""
-    return {"portfolio": portfolio, "watchlist": list(dict.fromkeys(watchlist)), "notes": notes}
+    return {"portfolio": portfolio, "watchlist": list(dict.fromkeys(watchlist)), "notes": notes, "manual": _clean_manual(data.get("manual", {}))}
 
 
 def save_user_data(data: Dict[str, Any], path: str = DATA_FILE) -> bool:
@@ -122,6 +162,30 @@ def save_note(ticker: str, note: Dict[str, Any], path: str = DATA_FILE) -> bool:
     return save_notes(notes, path)
 
 
+def save_manual(ticker: str, fields: Dict[str, Any], path: str = DATA_FILE) -> bool:
+    """Merge manual fields for one ticker. Empty fields dict clears it."""
+    data = load_user_data(path)
+    manual = data.get("manual", {}) or {}
+    clean_ticker = normalize_ticker(ticker)
+    if not clean_ticker:
+        return False
+    if not fields:
+        manual.pop(clean_ticker, None)
+    else:
+        merged = dict(manual.get(clean_ticker, {}))
+        merged.update(_clean_manual({clean_ticker: fields}).get(clean_ticker, {}))
+        if merged:
+            manual[clean_ticker] = merged
+        else:
+            manual.pop(clean_ticker, None)
+    data["manual"] = manual
+    return save_user_data(data, path)
+
+
+def clear_manual(ticker: str, path: str = DATA_FILE) -> bool:
+    return save_manual(ticker, {}, path)
+
+
 def save_last_scan(scan: Dict[str, Any], path: str = SCAN_FILE) -> bool:
     """Save a scan result + timestamp. Never raises; returns False on failure."""
     try:
@@ -144,12 +208,13 @@ def load_last_scan(path: str = SCAN_FILE) -> Tuple[Optional[Dict[str, Any]], Opt
         return None, None
 
 
-def parse_imported_data(data: Any) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
+def parse_imported_data(data: Any) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any], Dict[str, Any]]:
     """Validate an uploaded portfolio JSON. Raises ValueError on bad shape.
 
-    Accepted shape: {"portfolio": [{"ticker", "shares", "avg_cost"}], 
-    "watchlist": ["AAPL", ...], "notes": {"AAPL": {...}}} — portfolio is
-    required, watchlist/notes are optional and default to empty.
+    Accepted shape: {"portfolio": [{"ticker", "shares", "avg_cost"}],
+    "watchlist": ["AAPL", ...], "notes": {"AAPL": {...}},
+    "manual": {"AAPL": {...}}} — portfolio is required, watchlist/notes/
+    manual are optional and default to empty.
     """
     if not isinstance(data, dict) or not isinstance(data.get("portfolio"), list):
         raise ValueError("Expected a JSON object with a 'portfolio' list")
@@ -174,4 +239,5 @@ def parse_imported_data(data: Any) -> Tuple[List[Dict[str, Any]], List[str], Dic
         for ticker, note in raw_notes.items():
             if normalize_ticker(ticker or "") and isinstance(note, dict):
                 notes[normalize_ticker(ticker)] = {k: note.get(k, "") for k in NOTE_FIELDS}
-    return portfolio, list(dict.fromkeys(watchlist)), notes
+    manual = _clean_manual(data.get("manual", {}))
+    return portfolio, list(dict.fromkeys(watchlist)), notes, manual
