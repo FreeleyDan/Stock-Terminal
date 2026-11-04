@@ -285,6 +285,85 @@ def _deterioration_flags(snap: Dict[str, Any]) -> List[str]:
     return flags
 
 
+def _data_completeness(gatekeeper: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    How much Big Five history is actually determined, vs "not yet
+    determined" (missing history). The Moat Score excludes undetermined
+    horizons from its denominator, so a thin-data moat can look like a
+    thick-data moat without this check.
+    Returns {"metrics": n/5 with >=1 determined horizon,
+             "horizons": n/20 determined horizon checks,
+             "missing_metrics": [display names with no determined horizon]}.
+    """
+    big_five = (gatekeeper or {}).get("big_five") or {}
+    metrics = 0
+    horizons = 0
+    missing: List[str] = []
+    for metric in BIG_FIVE_METRICS:
+        hs = big_five.get(metric) or {}
+        determined = [h for h in HORIZONS if (hs.get(h) or {}).get("status") in ("pass", "fail")]
+        horizons += len(determined)
+        if determined:
+            metrics += 1
+        else:
+            missing.append(METRIC_DISPLAY_NAMES.get(metric, metric))
+    return {"metrics": metrics, "horizons": horizons, "missing_metrics": missing}
+
+
+def _latest_shares(snap: Dict[str, Any]) -> Optional[float]:
+    shares = snap.get("shares_history") or {}
+    if not isinstance(shares, dict):
+        return None
+    v = shares.get(0)
+    if v is None:
+        v = shares.get("0")
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _market_cap(snap: Dict[str, Any]) -> Optional[float]:
+    """Approximate market cap: current price × latest shares outstanding.
+    No new fetch — shares come from SEC filings already in the snapshot."""
+    price = snap.get("current_price")
+    shares = _latest_shares(snap)
+    if price is None or shares is None:
+        return None
+    try:
+        return float(price) * float(shares)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_market_cap(value: Optional[float]) -> str:
+    if value is None:
+        return "\u2014"
+    if value >= 1e12:
+        return f"${value / 1e12:.2f}T"
+    if value >= 1e9:
+        return f"${value / 1e9:.2f}B"
+    if value >= 1e6:
+        return f"${value / 1e6:.2f}M"
+    return money(value)
+
+
+def _peg_ratio(snap: Dict[str, Any]) -> Optional[float]:
+    """PEG = current P/E ÷ EPS growth rate (as a whole number, e.g. 12
+    for 12%). Uses historical EPS growth, not the capped growth used
+    for the sticker. None if EPS <= 0 or growth <= 0."""
+    price = snap.get("current_price")
+    eps = snap.get("current_eps")
+    growth = snap.get("growth_rate")
+    if not price or not eps or eps <= 0 or not growth or growth <= 0:
+        return None
+    try:
+        pe = float(price) / float(eps)
+        return pe / (float(growth) * 100.0)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
 def build_checklist_dataframe(gatekeeper: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     for metric in BIG_FIVE_METRICS:
@@ -338,12 +417,27 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
         st.markdown(render_metric_box("Action", action.replace("_", " "), ACTION_COLOR_CLASS.get(action, "metric-neutral")), unsafe_allow_html=True)
 
     st.markdown(f"**Moat Score:** {snap['moat_score']} / 100")
+    comp = _data_completeness(snap["gatekeeper"])
+    st.caption(
+        f"Data completeness: {comp['metrics']}/5 Big Five metrics with determined history "
+        f"({comp['horizons']}/20 horizon checks)"
+        + (f" — missing: {', '.join(comp['missing_metrics'])}" if comp["missing_metrics"] else "")
+    )
+    if comp["metrics"] <= 3:
+        st.warning(
+            "Thin data — this Moat Score is based on limited history. Treat it with less confidence "
+            "than a score with 5/5 metrics determined."
+        )
     details = [f"Last close {snap.get('price_date', '')}"]
     if val["growth_used"] is not None:
         g = snap["growth_rate"]
         details.append(f"EPS growth {g:.1%}" + (f" (capped at {max_growth:.0%} for valuation)" if g > max_growth else ""))
     if snap.get("historical_pe") is not None:
         details.append(f"median historical P/E {snap['historical_pe']:.1f}")
+    peg_card = _peg_ratio(snap)
+    if peg_card is not None:
+        details.append(f"PEG {peg_card:.2f} (current P/E ÷ EPS growth)")
+    details.append(f"Market cap ~{_format_market_cap(_market_cap(snap))}")
     if snap.get("dividend_streak"):
         details.append(f"dividend raised {snap['dividend_streak']} yrs in a row")
     st.caption(" \u00b7 ".join(details))
@@ -574,6 +668,10 @@ with tab_portfolio:
         st.info("Add a ticker above to see its buy/hold/sell signal.")
     else:
         rows, total_value, total_cost, total_div_income = [], 0.0, 0.0, 0.0
+        review_items: List[Dict[str, Any]] = []
+        projection_items: List[Dict[str, Any]] = []
+        projection_excluded: List[str] = []
+        projection_cost_included = 0.0
         with st.spinner("Checking your holdings..."):
             for h in holdings:
                 snap = build_snapshot(h["ticker"], price_max_age=TRACKING_PRICE_MAX_AGE)
@@ -581,8 +679,9 @@ with tab_portfolio:
                     rows.append({"Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": money(h["avg_cost"]), "Price": "\u2014",
                                  "Value": "\u2014", "Gain/Loss": "\u2014", "Gain %": "\u2014", "Sticker": "\u2014", "Moat": "\u2014",
                                  "Meaning": "\u2014", "Moat type": "\u2014", "Weight": "\u2014", "Div Income/yr": "\u2014",
-                                 "Yield on Cost": "\u2014", "Flags": "\u2014",
+                                 "Yield on Cost": "\u2014", "Flags": "\u2014", "Mkt Cap": "\u2014", "PEG": "\u2014", "Data": "\u2014",
                                  "Signal": "NO DATA", "Why": snap["error"], "_rank": 9, "_value": 0.0, "_moat": 0.0})
+                    review_items.append({"Ticker": h["ticker"], "Signal": "NO DATA", "Reason": snap["error"], "_urgency": 0})
                     continue
                 val = valuation_from_snapshot(snap, discount_rate, max_growth)
                 sig = portfolio_signal(
@@ -608,6 +707,57 @@ with tab_portfolio:
                     total_div_income += div_income
                 yoc = (dps_pf / h["avg_cost"]) if (dps_pf and h["avg_cost"]) else None
                 det = _deterioration_flags(snap)
+                comp_pf = _data_completeness(snap["gatekeeper"])
+                peg_pf = _peg_ratio(snap)
+                # Review queue reasons for this holding.
+                review_reasons: List[str] = []
+                review_urgency = 2
+                if sig["signal"] in ("SELL", "REVIEW"):
+                    review_reasons.append(f"Signal: {sig['signal']}")
+                    review_urgency = 0 if sig["signal"] == "SELL" else 1
+                if det:
+                    review_reasons.extend(det)
+                if comp_pf["metrics"] <= 3:
+                    review_reasons.append(f"Thin data: {comp_pf['metrics']}/5 Big Five metrics determined")
+                # Dividend safety / jeopardy, only for holdings with a
+                # known dividend (non-dividend holdings are not scored).
+                payout_pf = manual_pf.get("payout_ratio") if "payout_ratio" in manual_pf else snap.get("payout_ratio")
+                fcf_pf = manual_pf.get("fcf_dividend_coverage") if "fcf_dividend_coverage" in manual_pf else snap.get("fcf_dividend_coverage")
+                dgr_pf = manual_pf.get("dividend_growth_5yr") if "dividend_growth_5yr" in manual_pf else snap.get("dividend_growth_5yr")
+                if dps_pf is not None or payout_pf is not None:
+                    debt_pf = manual_pf.get("debt_ratio") if "debt_ratio" in manual_pf else ((snap.get("gatekeeper") or {}).get("debt_test") or {}).get("ratio")
+                    try:
+                        bf10_pf = big_five_pass_count(snap, 0.10)
+                    except Exception:
+                        bf10_pf = None
+                    safety_pf = dividend_safety_score(
+                        payout_pf, fcf_pf, debt_pf, snap.get("dividend_streak"), dgr_pf, bf10_pf,
+                        sector=manual_pf.get("sector"),
+                    )
+                    if safety_pf["score"] < 40:
+                        review_reasons.append(f"Safety Score {safety_pf['score']} {safety_pf['band']}")
+                        review_urgency = min(review_urgency, 2)
+                    if (payout_pf is not None and payout_pf > 1.0) or (fcf_pf is not None and fcf_pf < 1.0):
+                        review_reasons.append("Dividend in jeopardy (payout >100% or FCF cover <1x)")
+                        review_urgency = min(review_urgency, 1)
+                if review_reasons:
+                    review_items.append({"Ticker": h["ticker"], "Signal": sig["signal"], "Reason": "; ".join(review_reasons), "_urgency": review_urgency})
+                # Dividend income projection: current income grown at
+                # the 5-year dividend growth rate. Illustration only.
+                if div_income is not None and dgr_pf is not None and dgr_pf >= 0:
+                    inc5 = div_income * ((1.0 + dgr_pf) ** 5)
+                    inc10 = div_income * ((1.0 + dgr_pf) ** 10)
+                    yoc10 = ((dps_pf * ((1.0 + dgr_pf) ** 10)) / h["avg_cost"]) if (dps_pf and h["avg_cost"]) else None
+                    projection_items.append({
+                        "Ticker": h["ticker"], "Income now": money(div_income),
+                        "Income in 5 yrs": money(inc5), "Income in 10 yrs": money(inc10),
+                        "Yield on Cost in 10 yrs": "\u2014" if yoc10 is None else f"{yoc10:.1%}",
+                        "_inc10": inc10,
+                    })
+                    if h["shares"] and h["avg_cost"]:
+                        projection_cost_included += h["shares"] * h["avg_cost"]
+                elif div_income is not None:
+                    projection_excluded.append(h["ticker"])
                 rows.append({
                     "Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": money(h["avg_cost"]), "Price": money(price),
                     "Value": money(value), "Gain/Loss": money(gain),
@@ -617,6 +767,9 @@ with tab_portfolio:
                     "Weight": "\u2014", "Div Income/yr": money(div_income) + dps_label if div_income is not None else "\u2014",
                     "Yield on Cost": "\u2014" if yoc is None else f"{yoc:.1%}",
                     "Flags": "; ".join(det) if det else "\u2014",
+                    "Mkt Cap": _format_market_cap(_market_cap(snap)),
+                    "PEG": "\u2014" if peg_pf is None else f"{peg_pf:.2f}",
+                    "Data": f"{comp_pf['metrics']}/5" + (" ⚠️" if comp_pf["metrics"] <= 3 else ""),
                     "Signal": sig["signal"], "Why": "; ".join(sig["reasons"]), "_rank": PORTFOLIO_RANK.get(sig["signal"], 9),
                     "_value": value or 0.0, "_moat": snap["moat_score"] or 0.0,
                 })
@@ -627,6 +780,14 @@ with tab_portfolio:
         weighted_moat = (sum(r["_value"] * r["_moat"] for r in rows) / total_value) if total_value > 0 else None
         largest = max(rows, key=lambda r: r["_value"]) if rows else None
         rows.sort(key=lambda r: r["_rank"])
+        # Review queue first: only holdings needing attention, sorted
+        # by urgency (SELL, then REVIEW/jeopardy, then other flags).
+        if review_items:
+            review_items.sort(key=lambda r: r["_urgency"])
+            st.markdown("**Review queue — holdings needing attention**")
+            st.dataframe(pd.DataFrame(review_items).drop(columns=["_urgency"]), hide_index=True, use_container_width=True)
+        else:
+            st.caption("Review queue: no holdings need attention right now.")
         df = pd.DataFrame(rows).drop(columns=["_rank", "_value", "_moat"])
         st.dataframe(style_signal_column(df), hide_index=True, use_container_width=True)
         if total_cost > 0:
@@ -645,6 +806,21 @@ with tab_portfolio:
             st.markdown(f"**Weighted Moat Score:** {weighted_moat:.1f} / 100 (by position value)")
         if largest is not None and total_value > 0 and largest["_value"]:
             st.markdown(f"**Largest holding:** {largest['Ticker']} at {largest['_value'] / total_value:.1%} of portfolio value")
+        # Dividend income projection, if growth continues at the 5-year
+        # rate. This is an illustration, not a forecast — growth rates
+        # change, dividends can be cut, and holdings without a known
+        # DPS or growth rate are excluded (not counted as $0).
+        if projection_items:
+            st.markdown("**Dividend income projection — if dividend growth continues at the 5-year rate**")
+            proj_df = pd.DataFrame(projection_items).drop(columns=["_inc10"])
+            st.dataframe(proj_df, hide_index=True, use_container_width=True)
+            total_inc10 = sum(p["_inc10"] for p in projection_items)
+            st.caption(
+                f"Projected total in 10 yrs: {money(total_inc10)}/yr"
+                + (f" \u00b7 projected yield on cost (included holdings only): {total_inc10 / projection_cost_included:.1%}" if projection_cost_included > 0 else "")
+                + (f" \u00b7 excluded (no DPS or growth rate): {', '.join(projection_excluded)}" if projection_excluded else "")
+                + " \u00b7 Illustration only, not a forecast."
+            )
         counts = Counter(r["Signal"] for r in rows)
         st.caption(" \u00b7 ".join(f"{n} {s}" for s, n in counts.most_common()))
         export_data = load_user_data()
@@ -726,12 +902,25 @@ def _pct_or_dash(v: Any) -> str:
     return "\u2014" if v is None else f"{v:.1%}"
 
 
-def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat: float, quality_first: bool = True, download_key: str = "scan_csv", dividend_mode: bool = False, max_payout: Optional[float] = None, min_div_growth: Optional[float] = None, min_chowder: Optional[float] = None) -> None:
+def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat: float, quality_first: bool = True, download_key: str = "scan_csv", dividend_mode: bool = False, max_payout: Optional[float] = None, min_div_growth: Optional[float] = None, min_chowder: Optional[float] = None, min_market_cap_b: float = 0.0) -> None:
     # Dividend tab only (Miller / Van Knapp layer): filter snapshots
     # before ranking. A missing metric is shown as "—" and does NOT
     # exclude a stock — SEC dividend-per-share coverage is imperfect,
     # so unknown is not treated as failing.
     snapshots_for_rank = scan["snapshots"]
+    # Market-cap filter (all scan tabs): unknown market cap does NOT
+    # exclude a stock, for the same reason as above.
+    if min_market_cap_b and min_market_cap_b > 0:
+        cap_filtered = []
+        for snap in snapshots_for_rank:
+            if snap.get("error"):
+                cap_filtered.append(snap)
+                continue
+            cap = _market_cap(snap)
+            if cap is not None and cap < min_market_cap_b * 1e9:
+                continue
+            cap_filtered.append(snap)
+        snapshots_for_rank = cap_filtered
     if dividend_mode:
         # Apply manual dividend data first, so manual values count for
         # filters, Chowder, and the safety score — and are flagged ✏️.
@@ -799,8 +988,12 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
         st.info("Nothing matched. Loosen the filters, or run a wider scan.")
     else:
         rows = []
+        snap_map_all = {s.get("ticker"): s for s in snapshots_for_rank}
         for i, r in enumerate(ranked["top_results"], start=1):
             note_scan = _notes_for(r["ticker"])
+            snap_row = snap_map_all.get(r["ticker"], {})
+            comp_row = _data_completeness(snap_row.get("gatekeeper") or {}) if snap_row else {"metrics": 0, "horizons": 0, "missing_metrics": []}
+            peg_row = _peg_ratio(snap_row) if snap_row else None
             row: Dict[str, Any] = {
                 "#": i, "Ticker": r["ticker"], "Company": r["name"] or "", "Price": money(r["current_price"]),
                 "Sticker": money(r["sticker_price"]), "MOS Price": money(r["margin_of_safety_price"]),
@@ -808,6 +1001,9 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
                 "Moat": r["moat_score"], "Big Five": f"{r.get('big_five_passes', 0)}/5",
                 "Meaning": note_scan.get("meaning") or "\u2014", "Moat type": note_scan.get("moat_type") or "\u2014",
                 "Action": r["action"].replace("_", " "), "Div. Streak (yrs)": r["dividend_streak"],
+                "Mkt Cap": _format_market_cap(_market_cap(snap_row)) if snap_row else "\u2014",
+                "PEG": "\u2014" if peg_row is None else f"{peg_row:.2f}",
+                "Data": f"{comp_row['metrics']}/5" + (" ⚠️" if comp_row["metrics"] <= 3 else ""),
             }
             if dividend_mode:
                 payout = r.get("payout_ratio")
@@ -965,8 +1161,9 @@ with tab_undervalued:
         value=True, key="scan_quality_first",
     )
     min_moat_scan = st.slider("Minimum Moat Score (filter)", 0, 100, 0, key="scan_moat")
+    min_cap_scan = st.number_input("Minimum market cap ($ billions, 0 = no minimum; unknown cap does not exclude)", 0.0, 10000.0, 0.0, key="scan_mincap")
     if "scan" in st.session_state:
-        render_ranked_table(st.session_state["scan"], 0, float(min_moat_scan), quality_first=quality_first_scan, download_key="scan_csv")
+        render_ranked_table(st.session_state["scan"], 0, float(min_moat_scan), quality_first=quality_first_scan, download_key="scan_csv", min_market_cap_b=float(min_cap_scan))
     else:
         st.info("Pick a universe and click Scan.")
 
@@ -982,6 +1179,7 @@ with tab_dividends:
     max_payout_div = st.slider("Maximum payout ratio — DPS / EPS (your screener: generally under 65%; Miller: under 60% non-utilities)", 0, 100, 65, key="div_payout")
     min_div_growth_div = st.slider("Minimum 5-year dividend growth (Miller minimum: 4%)", 0, 20, 4, key="div_growth")
     min_chowder_div = st.slider("Minimum Chowder — yield + 5yr dividend growth (8%+ favored; 0 = show all, highlight in table)", 0, 15, 0, key="div_chowder")
+    min_cap_div = st.number_input("Minimum market cap ($ billions, 0 = no minimum; unknown cap does not exclude)", 0.0, 10000.0, 0.0, key="div_mincap")
     quality_first_div = st.checkbox(
         "Wonderful businesses first (same hurdle step-down as the Undervalued tab)",
         value=True, key="div_quality_first",
@@ -1075,6 +1273,7 @@ with tab_dividends:
             st.session_state["scan"], int(div_years), float(min_moat_div), quality_first=quality_first_div,
             download_key="div_csv", dividend_mode=True, max_payout=float(max_payout_div),
             min_div_growth=float(min_div_growth_div), min_chowder=float(min_chowder_div),
+            min_market_cap_b=float(min_cap_div),
         )
         st.caption(
             "Note: dividend metrics come from fresh SEC filings. A scan cached before this update won't have them "
