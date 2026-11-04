@@ -40,6 +40,11 @@ MANUAL_FIELDS = (
     "debt_ratio",  # x, long-term debt / owner earnings
 )
 
+# Manual sector tag (string, not numeric): used only to pick the
+# sector-aware payout tiers in the dividend safety score. The app does
+# NOT fetch sector from Yahoo — this is user-entered and flagged ✏️.
+MANUAL_SECTOR_OPTIONS = ("Utility", "REIT", "Other / standard")
+
 
 def _empty() -> Dict[str, Any]:
     return {"portfolio": [], "watchlist": [], "notes": {}, "manual": {}}
@@ -67,6 +72,9 @@ def _clean_manual(raw_manual: Any) -> Dict[str, Any]:
                 v = _to_float(entry.get(k))
                 if v is not None:
                     clean[k] = v
+        sector = entry.get("sector")
+        if isinstance(sector, str) and sector in MANUAL_SECTOR_OPTIONS:
+            clean["sector"] = sector
         if clean:
             manual[clean_ticker] = clean
     return manual

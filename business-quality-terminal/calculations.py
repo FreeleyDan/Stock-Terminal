@@ -150,6 +150,33 @@ def calculate_sticker_price(
         return None
 
 
+def calculate_ddm_value(
+    dividend_per_share: float,
+    dividend_growth_rate: float,
+    discount_rate: float,
+) -> Optional[float]:
+    """
+    Gordon growth Dividend Discount Model value — dividend tab only.
+
+    Value = DPS * (1 + growth) / (discount - growth). This is a
+    cross-check on the Rule #1 EPS sticker, not a replacement for it:
+    it values only the dividend stream, so it will usually be lower
+    than an EPS sticker for a company that retains most earnings.
+    Returns None if DPS <= 0, growth < 0, or discount <= growth
+    (the formula explodes when growth meets or exceeds the discount
+    rate, which is a sign the growth assumption is not sustainable).
+    """
+    try:
+        dps = float(dividend_per_share)
+        g = float(dividend_growth_rate)
+        r = float(discount_rate)
+        if dps <= 0 or g < 0 or r <= g:
+            return None
+        return dps * (1.0 + g) / (r - g)
+    except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+        return None
+
+
 def calculate_margin_of_safety(sticker_price: float) -> Optional[float]:
     """
     Margin of Safety (MOS) Price.

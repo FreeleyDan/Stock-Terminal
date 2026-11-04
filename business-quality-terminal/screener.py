@@ -29,6 +29,7 @@ def dividend_safety_score(
     dividend_streak: Optional[int],
     dividend_growth_5yr: Optional[float],
     big_five_passes: Optional[int],
+    sector: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Stock Terminal Dividend Safety Score — our own score, NOT Simply
@@ -53,6 +54,27 @@ def dividend_safety_score(
     def _payout_tier(p: Optional[float]) -> Optional[int]:
         if p is None:
             return None
+        # Sector-aware payout tiers (manual sector tag only — the app
+        # does not fetch sector). Utilities legitimately pay out more
+        # (Miller: up to 70-85%); REITs pay out most of FFO, so an EPS
+        # payout looks high even when the FFO payout is fine — REIT
+        # tiers are therefore looser and carry a caution in the UI.
+        if sector == "Utility":
+            if p <= 0.70:
+                return 25
+            if p <= 0.85:
+                return 18
+            if p <= 0.90:
+                return 8
+            return 0
+        if sector == "REIT":
+            if p <= 0.85:
+                return 25
+            if p <= 0.95:
+                return 18
+            if p <= 1.10:
+                return 8
+            return 0
         if p <= 0.50:
             return 25
         if p <= 0.65:
@@ -153,6 +175,7 @@ def dividend_safety_score(
     return {
         "score": total,
         "band": band,
+        "sector": sector,
         "components": {
             "payout_coverage": payout_component,
             "balance_sheet": balance_component,
@@ -198,6 +221,7 @@ def scan_snapshots(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     max_consecutive_transient: int = MAX_CONSECUTIVE_TRANSIENT_FAILURES,
     retry_delay: float = TRANSIENT_RETRY_DELAY_SECONDS,
+    partial_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """
     Returns {"snapshots": [valid snapshots], "errors": {ticker: message},
@@ -207,6 +231,13 @@ def scan_snapshots(
     early with `aborted` set instead of hammering them; re-run later and it
     resumes, because finished tickers are already cached. Never raises
     (except KeyboardInterrupt/Streamlit rerun, which stop the pool cleanly).
+
+    Partial saving: every 25 tickers (and at the end of an aborted run),
+    `partial_callback` is called with a partial result dict whose
+    "aborted" field says it is partial. The app saves that to disk, so
+    closing the browser mid-scan no longer loses the ranked table —
+    the next session loads the partial scan and Scan resumes it from
+    the per-ticker cache.
     """
     unique = list(dict.fromkeys(t.strip().upper() for t in tickers if t and t.strip()))
     total = len(unique)
@@ -247,6 +278,20 @@ def scan_snapshots(
             if progress_callback is not None:
                 try:
                     progress_callback(done, total, ticker)
+                except Exception:
+                    pass
+
+            if partial_callback is not None and done % 25 == 0:
+                try:
+                    partial_callback(
+                        {
+                            "snapshots": list(snapshots),
+                            "errors": dict(errors),
+                            "total": total,
+                            "done": done,
+                            "aborted": "Partial scan — saved as it goes. Click Scan again to resume/complete it.",
+                        }
+                    )
                 except Exception:
                     pass
 

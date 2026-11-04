@@ -26,11 +26,13 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
+from calculations import calculate_ddm_value, calculate_sticker_price
 from data_fetcher import clear_cache, normalize_ticker
 from gatekeeper import BIG_FIVE_METRICS, HORIZONS
 from screener import big_five_pass_count, dividend_safety_score, rank_snapshots, scan_snapshots, stepped_rank_snapshots
 from signals import BUY_RANK, PORTFOLIO_RANK, buy_signal, portfolio_signal, sell_signal
 from storage import (
+    MANUAL_SECTOR_OPTIONS,
     clear_manual,
     load_last_scan,
     load_user_data,
@@ -227,6 +229,8 @@ def _apply_manual_to_snapshot(snap: Dict[str, Any]) -> Dict[str, Any]:
         out["fcf_dividend_coverage"] = manual["fcf_dividend_coverage"]
     if "debt_ratio" in manual:
         out["debt_ratio_manual"] = manual["debt_ratio"]
+    if "sector" in manual:
+        out["sector_manual"] = manual["sector"]
     # Recompute Chowder / 10-by-10 from the (possibly manual) inputs.
     yld = out.get("dividend_yield")
     dgr = out.get("dividend_growth_5yr")
@@ -242,6 +246,43 @@ def _apply_manual_to_snapshot(snap: Dict[str, Any]) -> Dict[str, Any]:
 def _manual_label(manual_fields: List[str], field: str) -> str:
     """' ✏️' if this field was entered manually, else ''."""
     return " ✏️" if field in (manual_fields or []) else ""
+
+
+def _deterioration_flags(snap: Dict[str, Any]) -> List[str]:
+    """
+    Trend flags from data already in the snapshot — no new fetch.
+    A flag is a prompt to look closer, not a sell signal on its own.
+    - Big Five metric passing at 10yr but failing at 1yr or 3yr.
+    - Dividend did not increase in the latest year (streak 0 with a
+      dividend history of 2+ years — Miller's "not increased in 12
+      months" trigger).
+    - EPS growing much faster than free cash flow (>5 pp gap).
+    - Share count diluting: shares up >5% over 5 years.
+    Debt trend is NOT flagged: only the latest debt ratio is stored.
+    """
+    flags: List[str] = []
+    gk = snap.get("gatekeeper") or {}
+    big_five = gk.get("big_five") or {}
+    deteriorating = []
+    for metric in BIG_FIVE_METRICS:
+        horizons = big_five.get(metric) or {}
+        ten = (horizons.get(10) or {}).get("status")
+        recent_fail = (horizons.get(1) or {}).get("status") == "fail" or (horizons.get(3) or {}).get("status") == "fail"
+        if ten == "pass" and recent_fail:
+            deteriorating.append(metric)
+    if deteriorating:
+        flags.append(f"Big Five deteriorating (10yr pass, recent fail): {', '.join(deteriorating)}")
+    # Snapshots don't carry the full DPS date series (only the streak
+    # and growth rates), so use the streak itself as the trigger:
+    if snap.get("dividend_per_share") and snap.get("dividend_streak") == 0:
+        flags.append("Dividend did not increase in the latest year (streak 0) — check for a cut or freeze")
+    eps_cagr, fcf_cagr = _longest_cagr(gk, "EPS"), _longest_cagr(gk, "Free_Cash_Flow")
+    if eps_cagr is not None and fcf_cagr is not None and (eps_cagr - fcf_cagr) * 100.0 > 5.0:
+        flags.append("EPS growing >5 pp faster than free cash flow — earnings quality check")
+    ch5 = _share_change_pct(snap.get("shares_history") or {}, 5)
+    if ch5 is not None and ch5 > 5.0:
+        flags.append(f"Shares outstanding up {ch5:+.1f}% over 5 yrs (dilution)")
+    return flags
 
 
 def build_checklist_dataframe(gatekeeper: Dict[str, Any]) -> pd.DataFrame:
@@ -277,7 +318,7 @@ def style_signal_column(df: pd.DataFrame):
     return apply_fn(color, subset=["Signal"])
 
 
-def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str, Any]], max_growth: float) -> None:
+def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str, Any]], max_growth: float, discount_rate: float = 0.15) -> None:
     st.subheader(ticker + (f" \u2014 {snap['name']}" if snap.get("name") else ""))
     if snap.get("error"):
         st.warning(f"{ticker}: {snap['error']}")
@@ -309,6 +350,42 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
     if val["note"]:
         st.caption(val["note"])
     st.dataframe(build_checklist_dataframe(snap["gatekeeper"]), hide_index=True, use_container_width=True)
+
+    # Deterioration flags: trend prompts, not sell signals on their own.
+    det_flags = _deterioration_flags(snap)
+    if det_flags:
+        with st.expander(f"⚠️ Deterioration flags ({len(det_flags)})", expanded=False):
+            for flag in det_flags:
+                st.write(f"- {flag}")
+            st.caption("A flag is a prompt to look closer — e.g. a Big Five metric that passed at 10 years but fails recently, or a dividend that didn't increase this year. It does not by itself mean sell.")
+
+    # Sticker sensitivity: the sticker is a point estimate built from
+    # growth and discount guesses. Vary both around the current
+    # assumptions so the range — and the MOS range — is visible.
+    if val and val.get("growth_used") is not None and snap.get("current_eps") and snap.get("historical_pe"):
+        with st.expander("Sticker sensitivity — what if growth / discount is wrong?", expanded=False):
+            growth_centre = val["growth_used"]
+            growths = sorted({max(0.01, growth_centre - 0.03), growth_centre, growth_centre + 0.03})
+            discounts = sorted({max(0.06, discount_rate - 0.03), discount_rate, min(0.20, discount_rate + 0.03)})
+            sens_rows = []
+            for g in growths:
+                row_s: Dict[str, Any] = {"Growth": f"{g:.1%}" + (" ← current" if abs(g - growth_centre) < 1e-9 else "")}
+                for d in discounts:
+                    s = calculate_sticker_price(snap["current_eps"], g, snap["historical_pe"], d)
+                    row_s[f"Discount {d:.0%}" + (" ← current" if abs(d - discount_rate) < 1e-9 else "")] = money(s)
+                sens_rows.append(row_s)
+            st.dataframe(pd.DataFrame(sens_rows), hide_index=True, use_container_width=True)
+            stickers = [
+                calculate_sticker_price(snap["current_eps"], g, snap["historical_pe"], d)
+                for g in growths for d in discounts
+            ]
+            stickers = [s for s in stickers if s is not None]
+            if stickers:
+                st.caption(
+                    f"Sticker range in this table: {money(min(stickers))} – {money(max(stickers))}; "
+                    f"MOS range (50%): {money(min(stickers) * 0.5)} – {money(max(stickers) * 0.5)}. "
+                    f"The main sticker caps growth at {max_growth:.0%}; sensitivity varies growth around the growth actually used."
+                )
 
     # Numbers behind the checklist: debt, owner earnings, dilution,
     # and EPS-vs-FCF divergence (cash vs accounting — a Buffett check).
@@ -406,7 +483,7 @@ with tab_lookup:
         with st.spinner(f"Fetching {ticker}..."):
             snap = build_snapshot(ticker, price_max_age=LOOKUP_PRICE_MAX_AGE)
         val = None if snap.get("error") else valuation_from_snapshot(snap, discount_rate, max_growth)
-        render_ticker_card(ticker, snap, val, max_growth)
+        render_ticker_card(ticker, snap, val, max_growth, discount_rate)
 
 
 # --- 2. Portfolio ---------------------------------------------------------
@@ -496,15 +573,16 @@ with tab_portfolio:
     if not holdings:
         st.info("Add a ticker above to see its buy/hold/sell signal.")
     else:
-        rows, total_value, total_cost = [], 0.0, 0.0
+        rows, total_value, total_cost, total_div_income = [], 0.0, 0.0, 0.0
         with st.spinner("Checking your holdings..."):
             for h in holdings:
                 snap = build_snapshot(h["ticker"], price_max_age=TRACKING_PRICE_MAX_AGE)
                 if snap.get("error"):
                     rows.append({"Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": money(h["avg_cost"]), "Price": "\u2014",
                                  "Value": "\u2014", "Gain/Loss": "\u2014", "Gain %": "\u2014", "Sticker": "\u2014", "Moat": "\u2014",
-                                 "Meaning": "\u2014", "Moat type": "\u2014",
-                                 "Signal": "NO DATA", "Why": snap["error"], "_rank": 9})
+                                 "Meaning": "\u2014", "Moat type": "\u2014", "Weight": "\u2014", "Div Income/yr": "\u2014",
+                                 "Yield on Cost": "\u2014", "Flags": "\u2014",
+                                 "Signal": "NO DATA", "Why": snap["error"], "_rank": 9, "_value": 0.0, "_moat": 0.0})
                     continue
                 val = valuation_from_snapshot(snap, discount_rate, max_growth)
                 sig = portfolio_signal(
@@ -520,19 +598,53 @@ with tab_portfolio:
                     total_value += value
                 if h["shares"] and h["avg_cost"]:
                     total_cost += h["shares"] * h["avg_cost"]
+                # Dividend income: pulled DPS, or manual DPS (✏️) if the
+                # pull missed it. No DPS = no income estimate, not $0.
+                manual_pf = _manual_for(h["ticker"])
+                dps_pf = manual_pf.get("dividend_per_share") if "dividend_per_share" in manual_pf else snap.get("dividend_per_share")
+                dps_label = " ✏️" if "dividend_per_share" in manual_pf else ""
+                div_income = h["shares"] * dps_pf if (h["shares"] and dps_pf) else None
+                if div_income is not None:
+                    total_div_income += div_income
+                yoc = (dps_pf / h["avg_cost"]) if (dps_pf and h["avg_cost"]) else None
+                det = _deterioration_flags(snap)
                 rows.append({
                     "Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": money(h["avg_cost"]), "Price": money(price),
                     "Value": money(value), "Gain/Loss": money(gain),
                     "Gain %": "\u2014" if gain_pct is None else f"{gain_pct:+.1f}%",
                     "Sticker": money(val["sticker_price"]), "Moat": snap["moat_score"],
                     "Meaning": note_pf.get("meaning") or "\u2014", "Moat type": note_pf.get("moat_type") or "\u2014",
+                    "Weight": "\u2014", "Div Income/yr": money(div_income) + dps_label if div_income is not None else "\u2014",
+                    "Yield on Cost": "\u2014" if yoc is None else f"{yoc:.1%}",
+                    "Flags": "; ".join(det) if det else "\u2014",
                     "Signal": sig["signal"], "Why": "; ".join(sig["reasons"]), "_rank": PORTFOLIO_RANK.get(sig["signal"], 9),
+                    "_value": value or 0.0, "_moat": snap["moat_score"] or 0.0,
                 })
+        # Weights and weighted moat need the total first.
+        for r in rows:
+            if total_value > 0 and r["_value"]:
+                r["Weight"] = f"{r['_value'] / total_value:.1%}"
+        weighted_moat = (sum(r["_value"] * r["_moat"] for r in rows) / total_value) if total_value > 0 else None
+        largest = max(rows, key=lambda r: r["_value"]) if rows else None
         rows.sort(key=lambda r: r["_rank"])
-        df = pd.DataFrame(rows).drop(columns=["_rank"])
+        df = pd.DataFrame(rows).drop(columns=["_rank", "_value", "_moat"])
         st.dataframe(style_signal_column(df), hide_index=True, use_container_width=True)
         if total_cost > 0:
-            st.markdown(f"**Positions with shares and cost:** value of all positions {money(total_value)} \u00b7 cost basis {money(total_cost)}")
+            total_gain = total_value - total_cost
+            st.markdown(
+                f"**Portfolio totals:** value {money(total_value)} \u00b7 cost basis {money(total_cost)} \u00b7 "
+                f"gain/loss {money(total_gain)} ({total_gain / total_cost:+.1%})"
+            )
+        if total_div_income > 0:
+            st.markdown(
+                f"**Dividend income:** {money(total_div_income)}/yr from holdings with a known dividend per share"
+                + (f" \u00b7 yield on cost {total_div_income / total_cost:.1%}" if total_cost > 0 else "")
+                + " \u00b7 holdings with no DPS show \u2014, not $0, so this total may understate income."
+            )
+        if weighted_moat is not None:
+            st.markdown(f"**Weighted Moat Score:** {weighted_moat:.1f} / 100 (by position value)")
+        if largest is not None and total_value > 0 and largest["_value"]:
+            st.markdown(f"**Largest holding:** {largest['Ticker']} at {largest['_value'] / total_value:.1%} of portfolio value")
         counts = Counter(r["Signal"] for r in rows)
         st.caption(" \u00b7 ".join(f"{n} {s}" for s, n in counts.most_common()))
         export_data = load_user_data()
@@ -722,8 +834,10 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
                     bf_passes_10 = big_five_pass_count(snap_for_score, 0.10) if snap_for_score else None
                 except Exception:
                     bf_passes_10 = None
+                sector_manual = snap_for_score.get("sector_manual")
                 safety = dividend_safety_score(
-                    payout, fcf_cover, debt_ratio, r.get("dividend_streak"), r.get("dividend_growth_5yr"), bf_passes_10
+                    payout, fcf_cover, debt_ratio, r.get("dividend_streak"), r.get("dividend_growth_5yr"), bf_passes_10,
+                    sector=sector_manual,
                 )
                 chowder_label = _manual_label(manual_fields, "dividend_growth_5yr") or _manual_label(manual_fields, "dividend_per_share")
                 row["Div. Streak (yrs)"] = f"{r['dividend_streak']}{_manual_label(manual_fields, 'dividend_streak')}"
@@ -738,6 +852,36 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
                         "Div. flag": div_flag,
                         "Safety Score": f"{safety['score']} {safety['band']}" + (" *" if safety["missing"] else ""),
                         "Manual": "\u270f\ufe0f " + ", ".join(manual_fields) if manual_fields else "\u2014",
+                    }
+                )
+                # DDM + P/E cross-check, dividend tab only. DDM values
+                # only the dividend stream, so it is usually below the
+                # EPS sticker — agreement / disagreement is the signal,
+                # not an average of the two values.
+                dps_row = r.get("dividend_per_share")
+                dgr_row = r.get("dividend_growth_5yr")
+                ddm = calculate_ddm_value(dps_row, dgr_row, discount_rate) if (dps_row is not None and dgr_row is not None) else None
+                eps_row = snap_for_score.get("current_eps")
+                price_row = r.get("current_price")
+                current_pe = (price_row / eps_row) if (price_row and eps_row and eps_row > 0) else None
+                hist_pe = snap_for_score.get("historical_pe")
+                if ddm is not None and price_row is not None:
+                    # Fair-value comparison on both sides: price below
+                    # the Rule #1 sticker vs price below the DDM value.
+                    rule1_under = price_row <= (r.get("sticker_price") or 0)
+                    ddm_under = price_row <= ddm
+                    agreement = "Agree" if rule1_under == ddm_under else "\u26a0 Disagree"
+                else:
+                    agreement = "\u2014"
+                row.update(
+                    {
+                        "DDM Value": money(ddm),
+                        "DDM vs Price": "\u2014" if (ddm is None or not price_row) else f"{(ddm - price_row) / ddm:+.1f}%",
+                        "Current P/E": "\u2014" if current_pe is None else f"{current_pe:.1f}",
+                        "Hist P/E": "\u2014" if hist_pe is None else f"{hist_pe:.1f}",
+                        "P/E vs Hist": "\u2014" if (current_pe is None or not hist_pe) else f"{current_pe / hist_pe - 1:+.1%}",
+                        "Rule1/DDM": agreement,
+                        "Sector": (sector_manual + " ✏️") if sector_manual else "\u2014",
                     }
                 )
             rows.append(row)
@@ -769,7 +913,10 @@ with tab_undervalued:
         if last_scan is not None:
             st.session_state["scan"] = last_scan
             if last_saved_at:
-                st.caption(f"Loaded last saved scan from {datetime.fromtimestamp(last_saved_at).strftime('%Y-%m-%d %H:%M')}. Click Scan to refresh it.")
+                partial_note = ""
+                if last_scan.get("aborted") and "Partial scan" in str(last_scan.get("aborted")):
+                    partial_note = f" — partial scan ({last_scan.get('done', 0)} of {last_scan.get('total', 0)} tickers). Click Scan to resume it."
+                st.caption(f"Loaded last saved scan from {datetime.fromtimestamp(last_saved_at).strftime('%Y-%m-%d %H:%M')}.{partial_note} Click Scan to refresh it.")
     choice = st.radio("Universe", ["S&P 500", "All NYSE + Nasdaq stocks", "Custom list"], horizontal=True, key="scan_universe_choice")
     custom_text = ""
     if choice == "Custom list":
@@ -799,7 +946,14 @@ with tab_undervalued:
                 bar.progress(done / total if total else 1.0)
                 status.caption(f"Checked {done}/{total} (latest: {ticker})")
 
-            result = scan_snapshots(universe, progress_callback=on_progress)
+            def on_partial(partial: Dict[str, Any]) -> None:
+                # Saved to disk every 25 tickers, so closing the browser
+                # mid-scan no longer loses the ranked table.
+                partial_with_label = dict(partial)
+                partial_with_label["label"] = choice
+                save_last_scan(partial_with_label)
+
+            result = scan_snapshots(universe, progress_callback=on_progress, partial_callback=on_partial)
             bar.empty()
             status.empty()
             result["label"] = choice
@@ -852,6 +1006,14 @@ with tab_dividends:
             manual_streak = st.text_input("Consecutive years of dividend increases", key="manual_streak", placeholder="e.g. 12")
             manual_fcf = st.text_input("FCF dividend coverage (x)", key="manual_fcf", placeholder="e.g. 1.8")
             manual_debt = st.text_input("Debt ratio — LT debt / owner earnings (x)", key="manual_debt", placeholder="e.g. 1.5")
+            manual_sector_options = ["Not set"] + list(MANUAL_SECTOR_OPTIONS)
+            existing_sector = existing_manual.get("sector") if existing_manual else None
+            manual_sector = st.selectbox(
+                "Sector tag — only changes safety-score payout tiers (Utility up to 70–85%, REIT up to 85–95% on EPS; REIT EPS payout is not FFO, so treat with caution)",
+                manual_sector_options,
+                index=manual_sector_options.index(existing_sector) if existing_sector in manual_sector_options else 0,
+                key="manual_sector",
+            )
 
         def _parse_manual_pct(text: str) -> Optional[float]:
             try:
@@ -895,6 +1057,8 @@ with tab_dividends:
                     v = _parse_manual_num(manual_debt)
                     if v is not None:
                         fields["debt_ratio"] = v
+                if manual_sector != "Not set":
+                    fields["sector"] = manual_sector
                 if not fields:
                     st.warning("No valid numbers entered — nothing saved.")
                 elif save_manual(manual_ticker, fields):
