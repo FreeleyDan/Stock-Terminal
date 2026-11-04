@@ -29,7 +29,7 @@ import streamlit as st
 
 from calculations import calculate_ddm_value, calculate_sticker_price
 from data_fetcher import _build_financial_history, clear_cache, fetch_raw_companyfacts, normalize_ticker
-from holdings import NON_13F, check_holdings
+from holdings import NON_13F, check_holdings, check_nport
 from gatekeeper import BIG_FIVE_METRICS, HORIZONS
 from screener import big_five_pass_count, dividend_safety_score, rank_snapshots, scan_snapshots, stepped_rank_snapshots
 from signals import BUY_RANK, PORTFOLIO_RANK, buy_signal, portfolio_signal, sell_signal
@@ -766,7 +766,38 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
             st.dataframe(pd.DataFrame(rows_h), hide_index=True, use_container_width=True)
         for nf in NON_13F:
             st.caption(f"{nf['person']}: {nf['note']}")
-        st.caption("Phil Town's Rule One Fund (RULRX) files N-PORT, not 13F — that check is a separate build and is not in this table yet.")
+
+    # Phil Town — Rule One Fund, N-PORT (a mutual fund, not a 13F filer).
+    with st.expander("Phil Town / Rule One Fund — N-PORT eye check only", expanded=False):
+        st.caption(
+            "N-PORT is the fund's own holdings filing, not a 13F. Only public filings for a fiscal quarter-end month are "
+            "released, up to 60 days after quarter-end, so holdings can be ~4 months old. Only common-stock holdings are "
+            "shown — options/derivatives on the same issuer and the money-market position are excluded. Matching is by "
+            "issuer name, not CUSIP. A holding here is never a buy signal. The first check for a session scans the trust's "
+            "recent filings for this series and can take a while; the result is then cached for 24 hours."
+        )
+        if st.button("Check Rule One Fund holdings", key=f"nport_{ticker}"):
+            st.session_state.setdefault("nport_check", {})[ticker] = check_nport(ticker, snap.get("name"))
+        nport = (st.session_state.get("nport_check") or {}).get(ticker)
+        if nport:
+            if nport.get("error"):
+                st.warning(nport["error"])
+            elif not nport["holds"]:
+                st.write(f"Rule One Fund: No (by name) — report {nport.get('report_date') or '—'}, filed {nport.get('filing_date') or '—'}")
+            else:
+                rows_n = []
+                for m in nport["matches"]:
+                    rows_n.append({
+                        "Investor": "Phil Town", "Fund": "Rule One Fund (RULRX)",
+                        "Holds?": "Yes — class ambiguous, check CUSIP" if nport["ambiguous"] else "Yes",
+                        "Shares (as filed)": f"{m['shares']:,.0f}", "Value": money(m["value"]),
+                        "% of fund net assets": f"{m['pct_portfolio']:.1%}" if m.get("pct_portfolio") is not None else "—",
+                        "Report date": nport.get("report_date") or "—", "Filing date": nport.get("filing_date") or "—",
+                        "Issuer as filed": f"{m['issuer']} (CUSIP {m['cusip']})",
+                    })
+                st.dataframe(pd.DataFrame(rows_n), hide_index=True, use_container_width=True)
+                if nport.get("net_assets"):
+                    st.caption(f"Fund net assets at report date: {money(nport['net_assets'])}")
     st.divider()
 
 
