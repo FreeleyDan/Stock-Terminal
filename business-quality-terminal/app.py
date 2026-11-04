@@ -348,6 +348,18 @@ def _format_market_cap(value: Optional[float]) -> str:
     return money(value)
 
 
+def _prices_as_of_caption(dates: List[Any]) -> str:
+    """One-line prices-as-of note from snapshot price_dates. A cached
+    scan or a tracking-price refresh can leave prices a day (or more)
+    old, so the date must be visible, not assumed to be live."""
+    uniq = sorted({str(d) for d in dates if d})
+    if not uniq:
+        return ""
+    if len(uniq) == 1:
+        return f"Prices as of {uniq[0]} (last close in the snapshots)."
+    return f"Prices as of {uniq[0]} – {uniq[-1]} (varies by ticker; each price is its last close)."
+
+
 def _peg_ratio(snap: Dict[str, Any]) -> Optional[float]:
     """PEG = current P/E ÷ EPS growth rate (as a whole number, e.g. 12
     for 12%). Uses historical EPS growth, not the capped growth used
@@ -672,6 +684,7 @@ with tab_portfolio:
         projection_items: List[Dict[str, Any]] = []
         projection_excluded: List[str] = []
         projection_cost_included = 0.0
+        portfolio_price_dates: List[Any] = []
         with st.spinner("Checking your holdings..."):
             for h in holdings:
                 snap = build_snapshot(h["ticker"], price_max_age=TRACKING_PRICE_MAX_AGE)
@@ -684,6 +697,8 @@ with tab_portfolio:
                     review_items.append({"Ticker": h["ticker"], "Signal": "NO DATA", "Reason": snap["error"], "_urgency": 0})
                     continue
                 val = valuation_from_snapshot(snap, discount_rate, max_growth)
+                if snap.get("price_date"):
+                    portfolio_price_dates.append(snap["price_date"])
                 sig = portfolio_signal(
                     snap, val, h["avg_cost"], approach_pct, min_moat_hold, float(max_loss_pct),
                     min_moat_buy_pf, float(near_buy_pct_pf),
@@ -790,6 +805,9 @@ with tab_portfolio:
             st.caption("Review queue: no holdings need attention right now.")
         df = pd.DataFrame(rows).drop(columns=["_rank", "_value", "_moat"])
         st.dataframe(style_signal_column(df), hide_index=True, use_container_width=True)
+        as_of_pf = _prices_as_of_caption(portfolio_price_dates)
+        if as_of_pf:
+            st.caption(as_of_pf)
         if total_cost > 0:
             total_gain = total_value - total_cost
             st.markdown(
@@ -873,26 +891,41 @@ with tab_watchlist:
         st.info("Add a ticker above to see its buy signal.")
     else:
         rows = []
+        watch_price_dates: List[Any] = []
         with st.spinner("Checking your watchlist..."):
             for t in watch:
                 snap = build_snapshot(t, price_max_age=TRACKING_PRICE_MAX_AGE)
                 if snap.get("error"):
                     rows.append({"Ticker": t, "Price": "\u2014", "Sticker": "\u2014", "Buy Below": "\u2014", "% Above Buy Price": "\u2014",
-                                 "Moat": "\u2014", "Signal": "NO DATA", "Why": snap["error"], "_rank": 9, "_pct": 1e9})
+                                 "Moat": "\u2014", "Mkt Cap": "\u2014", "PEG": "\u2014", "Data": "\u2014", "Flags": "\u2014",
+                                 "Signal": "NO DATA", "Why": snap["error"], "_rank": 9, "_pct": 1e9})
                     continue
                 val = valuation_from_snapshot(snap, discount_rate, max_growth)
                 sig = buy_signal(snap, val, float(min_moat_buy), float(near_buy_pct))
                 pct = sig["pct_above_buy"]
+                comp_w = _data_completeness(snap["gatekeeper"])
+                peg_w = _peg_ratio(snap)
+                det_w = _deterioration_flags(snap)
+                if snap.get("price_date"):
+                    watch_price_dates.append(snap["price_date"])
                 rows.append({
                     "Ticker": t, "Price": money(snap["current_price"]), "Sticker": money(val["sticker_price"]),
                     "Buy Below": money(val["margin_of_safety_price"]),
                     "% Above Buy Price": "\u2014" if pct is None else f"{pct:+.1f}%",
-                    "Moat": snap["moat_score"], "Signal": sig["signal"], "Why": "; ".join(sig["reasons"]),
+                    "Moat": snap["moat_score"],
+                    "Mkt Cap": _format_market_cap(_market_cap(snap)),
+                    "PEG": "\u2014" if peg_w is None else f"{peg_w:.2f}",
+                    "Data": f"{comp_w['metrics']}/5" + (" ⚠️" if comp_w["metrics"] <= 3 else ""),
+                    "Flags": "; ".join(det_w) if det_w else "\u2014",
+                    "Signal": sig["signal"], "Why": "; ".join(sig["reasons"]),
                     "_rank": BUY_RANK.get(sig["signal"], 9), "_pct": pct if pct is not None else 1e9,
                 })
         rows.sort(key=lambda r: (r["_rank"], r["_pct"]))
         df = pd.DataFrame(rows).drop(columns=["_rank", "_pct"])
         st.dataframe(style_signal_column(df), hide_index=True, use_container_width=True)
+        as_of_w = _prices_as_of_caption(watch_price_dates)
+        if as_of_w:
+            st.caption(as_of_w)
         counts = Counter(r["Signal"] for r in rows)
         st.caption(" \u00b7 ".join(f"{n} {s}" for s, n in counts.most_common()))
 
@@ -921,6 +954,9 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
                 continue
             cap_filtered.append(snap)
         snapshots_for_rank = cap_filtered
+    as_of_scan = _prices_as_of_caption([s.get("price_date") for s in snapshots_for_rank if not s.get("error")])
+    if as_of_scan:
+        st.caption(as_of_scan + " A cached scan keeps its prices until you re-scan.")
     if dividend_mode:
         # Apply manual dividend data first, so manual values count for
         # filters, Chowder, and the safety score — and are flagged ✏️.
