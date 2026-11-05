@@ -29,7 +29,7 @@ import streamlit as st
 
 from calculations import calculate_ddm_value, calculate_sticker_price
 from data_fetcher import _build_financial_history, clear_cache, fetch_raw_companyfacts, normalize_ticker
-from holdings import NON_13F, check_holdings, check_nport
+from holdings import NON_13F, check_holdings
 from gatekeeper import BIG_FIVE_METRICS, HORIZONS
 from screener import big_five_pass_count, dividend_safety_score, rank_snapshots, scan_snapshots, stepped_rank_snapshots
 from signals import BUY_RANK, PORTFOLIO_RANK, buy_signal, portfolio_signal, sell_signal
@@ -759,67 +759,44 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
                     st.write("ROIC level: — (not in SEC history)")
 
     # Value-investor holdings — eye check only, from SEC filings.
-    with st.expander("Value-investor holdings — eye check only (SEC 13F, lagged)", expanded=False):
+    # One expander, one button, one table: the 13F managers plus Phil
+    # Town's Rule One Fund (N-PORT, not a 13F filer), marked by Source.
+    with st.expander("Value-investor holdings — eye check only (SEC filings, lagged)", expanded=False):
         st.caption(
-            "13F is quarterly and due up to 45 days after quarter-end, so holdings can be ~4 months old; shorts, cash, "
-            "bonds, and non-US positions are excluded. Matching is by issuer name, not CUSIP — class shares "
-            "(e.g. GOOG vs GOOGL) are flagged ambiguous instead of guessed. A holding here is never a buy signal."
+            "Holdings are quarterly and can be ~4 months old. 13F filings are due up to 45 days after quarter-end and "
+            "exclude shorts, cash, bonds, and non-US positions; Phil Town's Rule One Fund files N-PORT instead (only "
+            "public filings for a fiscal quarter-end month, up to 60 days after quarter-end, common stock only — "
+            "options/derivatives and the money-market position excluded). Matching is by issuer name, not CUSIP — class "
+            "shares (e.g. GOOG vs GOOGL) are flagged ambiguous instead of guessed. A holding here is never a buy signal. "
+            "The first check for a session scans the Rule One trust's recent filings for its series and can take a while; "
+            "results are then cached for 24 hours."
         )
-        if st.button("Check latest 13F holdings", key=f"holdings_{ticker}"):
+        if st.button("Check investor holdings", key=f"holdings_{ticker}"):
             st.session_state.setdefault("holdings_check", {})[ticker] = check_holdings(ticker, snap.get("name"))
         held = (st.session_state.get("holdings_check") or {}).get(ticker)
         if held:
             rows_h = []
             for r in held:
                 if r.get("error"):
-                    rows_h.append({"Investor": r["person"], "Manager": r["manager"], "Holds?": "— (fetch failed)", "Shares": "—", "Value": "—", "% of 13F portfolio": "—", "Report date": r.get("report_date") or "—", "Filing date": r.get("filing_date") or "—", "Issuer as filed": r["error"]})
+                    rows_h.append({"Investor": r["person"], "Manager": r["manager"], "Source": r.get("source") or "—", "Holds?": "— (fetch failed)", "Shares": "—", "Value": "—", "% of portfolio": "—", "Report date": r.get("report_date") or "—", "Filing date": r.get("filing_date") or "—", "Issuer as filed": r["error"]})
                 elif not r["holds"]:
-                    rows_h.append({"Investor": r["person"], "Manager": r["manager"], "Holds?": "No (by name)", "Shares": "—", "Value": "—", "% of 13F portfolio": "—", "Report date": r.get("report_date") or "—", "Filing date": r.get("filing_date") or "—", "Issuer as filed": "—"})
+                    rows_h.append({"Investor": r["person"], "Manager": r["manager"], "Source": r.get("source") or "—", "Holds?": "No (by name)", "Shares": "—", "Value": "—", "% of portfolio": "—", "Report date": r.get("report_date") or "—", "Filing date": r.get("filing_date") or "—", "Issuer as filed": "—"})
                 else:
                     for m in r["matches"]:
                         rows_h.append({
-                            "Investor": r["person"], "Manager": r["manager"],
+                            "Investor": r["person"], "Manager": r["manager"], "Source": r.get("source") or "—",
                             "Holds?": "Yes — class ambiguous, check CUSIP" if r["ambiguous"] else "Yes",
-                            "Shares": f"{m['shares']:,}", "Value": money(m["value"]),
-                            " % of 13F portfolio".strip(): f"{m['pct_portfolio']:.1%}" if m.get("pct_portfolio") is not None else "—",
+                            "Shares": f"{m['shares']:,.0f}", "Value": money(m["value"]),
+                            "% of portfolio": f"{m['pct_portfolio']:.1%}" if m.get("pct_portfolio") is not None else "—",
                             "Report date": r.get("report_date") or "—", "Filing date": r.get("filing_date") or "—",
                             "Issuer as filed": f"{m['issuer']} (CUSIP {m['cusip']})",
                         })
             st.dataframe(pd.DataFrame(rows_h), hide_index=True, use_container_width=True)
+            for r in held:
+                if r.get("source") == "N-PORT" and r.get("net_assets"):
+                    st.caption(f"Rule One Fund net assets at report date: {money(r['net_assets'])}")
         for nf in NON_13F:
             st.caption(f"{nf['person']}: {nf['note']}")
-
-    # Phil Town — Rule One Fund, N-PORT (a mutual fund, not a 13F filer).
-    with st.expander("Phil Town / Rule One Fund — N-PORT eye check only", expanded=False):
-        st.caption(
-            "N-PORT is the fund's own holdings filing, not a 13F. Only public filings for a fiscal quarter-end month are "
-            "released, up to 60 days after quarter-end, so holdings can be ~4 months old. Only common-stock holdings are "
-            "shown — options/derivatives on the same issuer and the money-market position are excluded. Matching is by "
-            "issuer name, not CUSIP. A holding here is never a buy signal. The first check for a session scans the trust's "
-            "recent filings for this series and can take a while; the result is then cached for 24 hours."
-        )
-        if st.button("Check Rule One Fund holdings", key=f"nport_{ticker}"):
-            st.session_state.setdefault("nport_check", {})[ticker] = check_nport(ticker, snap.get("name"))
-        nport = (st.session_state.get("nport_check") or {}).get(ticker)
-        if nport:
-            if nport.get("error"):
-                st.warning(nport["error"])
-            elif not nport["holds"]:
-                st.write(f"Rule One Fund: No (by name) — report {nport.get('report_date') or '—'}, filed {nport.get('filing_date') or '—'}")
-            else:
-                rows_n = []
-                for m in nport["matches"]:
-                    rows_n.append({
-                        "Investor": "Phil Town", "Fund": "Rule One Fund (RULRX)",
-                        "Holds?": "Yes — class ambiguous, check CUSIP" if nport["ambiguous"] else "Yes",
-                        "Shares (as filed)": f"{m['shares']:,.0f}", "Value": money(m["value"]),
-                        "% of fund net assets": f"{m['pct_portfolio']:.1%}" if m.get("pct_portfolio") is not None else "—",
-                        "Report date": nport.get("report_date") or "—", "Filing date": nport.get("filing_date") or "—",
-                        "Issuer as filed": f"{m['issuer']} (CUSIP {m['cusip']})",
-                    })
-                st.dataframe(pd.DataFrame(rows_n), hide_index=True, use_container_width=True)
-                if nport.get("net_assets"):
-                    st.caption(f"Fund net assets at report date: {money(nport['net_assets'])}")
     st.divider()
 
 
