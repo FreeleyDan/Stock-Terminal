@@ -18,6 +18,7 @@ import os
 import pickle
 import shutil
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from data_fetcher import normalize_ticker
@@ -263,6 +264,19 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
         "portfolio_account_types": account_types, "tax_rates": tax_rates, "sales_log": sales,
         "notes": notes, "manual": _clean_manual(data.get("manual", {})),
     }
+
+
+def last_saved_display(path: str = DATA_FILE) -> Optional[str]:
+    """When user_data.json was last written on this server, or None if
+    there is no saved file here. Used for the persistence warning in
+    the UI: Streamlit Cloud's filesystem is ephemeral, so a restart or
+    sleep can wipe the file, and the export download is the permanent
+    copy. The file's mtime is the save time — no extra field needed."""
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        return None
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def save_user_data(data: Dict[str, Any], path: str = DATA_FILE) -> bool:

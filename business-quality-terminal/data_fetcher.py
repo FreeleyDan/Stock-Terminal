@@ -365,16 +365,30 @@ def _split_factor(filed_date: str, splits: Optional[List[Tuple[str, float]]]) ->
     return factor
 
 
-def _get_best_tag_series(
+def _get_best_tag_series_with_tag(
     raw_companyfacts: Dict[str, Any],
     metric_key: str,
     splits: Optional[List[Tuple[str, float]]] = None,
-) -> Dict[str, float]:
-    """First candidate tag with data, split-adjusted where the metric is
-    per-share or a share count."""
+) -> Tuple[Dict[str, float], Optional[str]]:
+    """Best-tag series, split-adjusted where the metric is per-share or
+    a share count. Returns (series, primary_tag).
+
+    BUG FIX (2026-11-04): the old version returned the FIRST candidate
+    tag with any data. That silently truncated history when the first
+    tag only exists for recent years — e.g. AAPL Sales under "Revenues"
+    exists only from ~2015, while "SalesRevenueNet" has the full history,
+    so early Sales horizons looked missing and Big Five passes / Moat
+    were understated. Now every candidate tag's full series is built,
+    tags are ranked by coverage (most fiscal year-ends, then latest end,
+    then candidate order), and values are merged date-by-date with the
+    fuller tag winning each date and thinner tags filling gaps only.
+    The primary tag (most coverage) is returned so the UI can show
+    which SEC tag supplied each metric.
+    """
     expected_unit = METRIC_UNIT[metric_key]
     is_duration = metric_key in DURATION_METRICS
 
+    per_tag: List[Tuple[str, Dict[str, float]]] = []
     for tag in TAG_CANDIDATES[metric_key]:
         full = _extract_tag_series_full(raw_companyfacts, tag, expected_unit, is_duration)
         if not full:
@@ -388,8 +402,28 @@ def _get_best_tag_series(
                 series[end] = val * factor
             else:
                 series[end] = val
-        return series
-    return {}
+        per_tag.append((tag, series))
+    if not per_tag:
+        return {}, None
+    # Rank: most year-ends first, then latest end date, then candidate order.
+    order = {tag: i for i, tag in enumerate(TAG_CANDIDATES[metric_key])}
+    per_tag.sort(key=lambda ts: (-len(ts[1]), max(ts[1]) if ts[1] else "", order.get(ts[0], 99)))
+    primary_tag = per_tag[0][0]
+    merged: Dict[str, float] = {}
+    for _tag, series in per_tag:
+        for end, val in series.items():
+            merged.setdefault(end, val)
+    return merged, primary_tag
+
+
+def _get_best_tag_series(
+    raw_companyfacts: Dict[str, Any],
+    metric_key: str,
+    splits: Optional[List[Tuple[str, float]]] = None,
+) -> Dict[str, float]:
+    """Best-tag series (see _get_best_tag_series_with_tag)."""
+    series, _tag = _get_best_tag_series_with_tag(raw_companyfacts, metric_key, splits)
+    return series
 
 
 def _map_series_to_horizons(series: Dict[str, float]) -> Dict[int, float]:
@@ -441,10 +475,13 @@ def _build_financial_history(
     consumes. Pass `splits` ([(iso_date, ratio)]) to split-adjust EPS,
     dividends/share and share counts.
     """
-    raw_series = {
-        metric: _get_best_tag_series(raw_companyfacts, metric, splits)
-        for metric in TAG_CANDIDATES
-    }
+    raw_series: Dict[str, Dict[str, float]] = {}
+    tag_used: Dict[str, str] = {}
+    for metric in TAG_CANDIDATES:
+        series, tag = _get_best_tag_series_with_tag(raw_companyfacts, metric, splits)
+        raw_series[metric] = series
+        if tag is not None:
+            tag_used[metric] = tag
     by_horizon = {m: _map_series_to_horizons(s) for m, s in raw_series.items()}
 
     net_income = by_horizon["Net_Income"]
@@ -468,12 +505,25 @@ def _build_financial_history(
     invested_capital = _combine_horizon_dicts(equity_plus_debt, cash, lambda a, b: a - b)
 
     # Non-positive invested capital (e.g. buyback-driven negative equity at
-    # MCD/SBUX) makes ROIC meaningless, so those horizons are dropped.
+    # MCD/SBUX) makes ROIC meaningless, so those horizons are dropped —
+    # but they are now RECORDED in _roic_dropped instead of vanishing
+    # silently, so the UI can say why ROIC (and the Moat points it feeds)
+    # is missing for those horizons.
     roic: Dict[int, float] = {}
+    roic_dropped: Dict[int, str] = {}
     for y, ni in net_income.items():
         ic = invested_capital.get(y)
         if ic is not None and ic > 0:
             roic[y] = ni / ic
+        elif ic is not None:
+            roic_dropped[y] = (
+                "invested capital ≤ 0 (equity + debt − cash), so ROIC is meaningless — "
+                "common at buyback-heavy companies with negative equity"
+            )
+        else:
+            roic_dropped[y] = (
+                "invested capital unavailable (missing equity, debt, or cash in SEC filings)"
+            )
 
     equity_per_share = _combine_horizon_dicts(equity, shares, lambda a, b: a / b if b else None)
 
@@ -492,6 +542,9 @@ def _build_financial_history(
         "_net_income_history": net_income,
         "_eps_history": eps,
         "_shares_outstanding_history": shares,
+        "_invested_capital_history": invested_capital,
+        "_roic_dropped": roic_dropped,
+        "_tag_used": tag_used,
         # Full {fiscal_year_end: value} series (split-adjusted), not
         # horizon-mapped: dividend streaks need every year, and the
         # historical P/E needs each year's EPS paired with its own price.

@@ -235,6 +235,10 @@ def _evaluate(ticker: str, prune_unvaluable: bool) -> Tuple[Dict[str, Any], Opti
         # snapshots — callers must use .get() with a fallback):
         "owner_earnings": (hist.get("_owner_earnings_history") or {}).get(0),
         "shares_history": hist.get("_shares_outstanding_history") or {},
+        # ROIC dropouts and SEC tags used — missing from older cached
+        # snapshots, so callers must use .get() with a fallback.
+        "roic_dropped": hist.get("_roic_dropped") or {},
+        "tag_used": hist.get("_tag_used") or {},
         # Dividend-growth metrics — dividend tab only (Miller / Van Knapp).
         # Missing from older cached snapshots; callers must use .get().
         **div_metrics,
