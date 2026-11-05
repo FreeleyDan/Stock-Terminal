@@ -1336,22 +1336,27 @@ with tab_portfolio:
         st.session_state[pf_df_key] = frame
         st.session_state[pf_saved_key] = saved_pf
 
-    edited = st.data_editor(
-        st.session_state[pf_df_key],
-        num_rows="dynamic",
-        hide_index=True,
-        use_container_width=True,
-        key=f"portfolio_editor_{pf_name}",
-        column_config={
-            "Ticker": st.column_config.TextColumn("Ticker"),
-            "Shares": st.column_config.NumberColumn("Shares", min_value=0.0),
-            "Avg Cost": st.column_config.NumberColumn("Avg Cost", min_value=0.0, format="$%.2f"),
-            "Target %": st.column_config.NumberColumn("Target % of account (blank = no target)", min_value=0.0, max_value=100.0),
-            "DRIP": st.column_config.CheckboxColumn("DRIP (dividends reinvested)"),
-            "Purchase Date": st.column_config.TextColumn("Purchase Date (YYYY-MM-DD, blank = unknown)"),
-        },
-    )
-    st.caption("Purchase Date is a single-lot assumption: if you bought a holding in multiple lots at different times, one date cannot split long-term vs short-term per lot. Tax columns below use this date, and only for Taxable portfolios.")
+    # The holdings editor lives in a collapsed expander so the input
+    # grid doesn't clog the page — open it only to add, remove, or
+    # change a holding. Everything below it (signals, totals, tax)
+    # reads the same saved holdings.
+    with st.expander("Edit holdings — add, remove, or change tickers, shares, cost, targets, purchase dates", expanded=False):
+        edited = st.data_editor(
+            st.session_state[pf_df_key],
+            num_rows="dynamic",
+            hide_index=True,
+            use_container_width=True,
+            key=f"portfolio_editor_{pf_name}",
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker"),
+                "Shares": st.column_config.NumberColumn("Shares", min_value=0.0),
+                "Avg Cost": st.column_config.NumberColumn("Avg Cost", min_value=0.0, format="$%.2f"),
+                "Target %": st.column_config.NumberColumn("Target % of account (blank = no target)", min_value=0.0, max_value=100.0),
+                "DRIP": st.column_config.CheckboxColumn("DRIP (dividends reinvested)"),
+                "Purchase Date": st.column_config.TextColumn("Purchase Date (YYYY-MM-DD, blank = unknown)"),
+            },
+        )
+        st.caption("Purchase Date is a single-lot assumption: if you bought a holding in multiple lots at different times, one date cannot split long-term vs short-term per lot. Tax columns below use this date, and only for Taxable portfolios.")
     holdings = clean_portfolio_rows(edited)
     if holdings != st.session_state[pf_saved_key]:
         if save_portfolio(holdings, name=pf_name):
