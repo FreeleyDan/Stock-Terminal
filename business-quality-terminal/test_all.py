@@ -328,6 +328,11 @@ d = storage.load_user_data(p)
 check("sanitizes junk rows / NaN / bad numbers", d["portfolio"], [{"ticker": "BRK-B", "shares": None, "avg_cost": None, "drip": False}])
 check("watchlist deduped + normalized", d["watchlist"], ["A", "B-C"])
 check("save to an unwritable path returns False, doesn't raise", storage.save_user_data({}, "/nonexistent-dir/x.json"), False)
+check("save dividend goal", storage.save_dividend_goal(12000.0, path=p))
+d = storage.load_user_data(p)
+check("dividend goal round-trips", d.get("dividend_income_goal"), 12000.0)
+check("negative dividend goal clamps to 0", storage.save_dividend_goal(-5.0, path=p) and storage.load_user_data(p).get("dividend_income_goal"), 0.0)
+check("missing file -> dividend goal defaults to 0", storage.load_user_data(os.path.join(TMP, "nope.json")).get("dividend_income_goal"), 0.0)
 
 # --------------------------------------------------------------------------
 section("Scanner")

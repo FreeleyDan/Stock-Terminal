@@ -54,6 +54,7 @@ def _empty() -> Dict[str, Any]:
         "portfolio_cash": {"Main": 0.0}, "scan_presets": {"undervalued": {}, "dividend": {}},
         "signal_log": [], "portfolio_account_types": {"Main": "Not set"},
         "tax_rates": {"lt_pct": 0.0, "st_pct": 0.0, "ca_pct": 0.0}, "sales_log": [],
+        "dividend_income_goal": 0.0,
     }
 
 
@@ -262,6 +263,7 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
         "portfolios": portfolios, "watchlists": watchlists, "portfolio_cash": cash,
         "scan_presets": presets, "signal_log": log,
         "portfolio_account_types": account_types, "tax_rates": tax_rates, "sales_log": sales,
+        "dividend_income_goal": _to_float(data.get("dividend_income_goal")) or 0.0,
         "notes": notes, "manual": _clean_manual(data.get("manual", {})),
     }
 
@@ -374,6 +376,13 @@ def save_tax_rates(lt_pct: float, st_pct: float, ca_pct: float, path: str = DATA
         "st_pct": max(0.0, min(100.0, float(st_pct or 0.0))),
         "ca_pct": max(0.0, min(100.0, float(ca_pct or 0.0))),
     }
+    return save_user_data(data, path)
+
+
+def save_dividend_goal(goal: float, path: str = DATA_FILE) -> bool:
+    """Save the annual dividend income goal ($/yr) tracked on the Dashboard."""
+    data = load_user_data(path)
+    data["dividend_income_goal"] = max(0.0, float(goal or 0.0))
     return save_user_data(data, path)
 
 

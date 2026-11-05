@@ -78,6 +78,7 @@ from storage import (
     load_user_data,
     save_account_type,
     save_cash,
+    save_dividend_goal,
     save_last_scan,
     save_manual,
     save_note,
@@ -1147,6 +1148,7 @@ with tab_dashboard:
     _dash_portfolios = _dash_data.get("portfolios") or {}
     _dash_watchlists = _dash_data.get("watchlists") or {}
     _dash_cash = _dash_data.get("portfolio_cash") or {}
+    _dash_div = 0.0
     if not any(_dash_portfolios.values()) and not any(_dash_watchlists.values()):
         st.info("Nothing to summarize yet — add a holding on the Portfolio tab or a ticker on the Watchlist tab.")
     else:
@@ -1258,6 +1260,33 @@ with tab_dashboard:
             "this session). Gain/loss and dividend income count only holdings with shares and a cost / dividend "
             "per share recorded. Totals include cash across all portfolios."
         )
+    # --- Dividend income goal -------------------------------------------
+    # One overall annual goal, saved in user_data.json. Progress uses the
+    # same projected dividend income/yr as the metric above (shares x
+    # dividend per share across every portfolio).
+    _div_goal = float(_dash_data.get("dividend_income_goal") or 0.0)
+    st.subheader("Dividend income goal")
+    _goal_in = st.number_input(
+        "Annual dividend income goal ($/yr)", min_value=0.0, value=_div_goal,
+        step=100.0, key="div_goal_input",
+        help="The yearly dividend income you want your portfolios to reach. "
+        "Progress below uses the same projected income as the Dividend income/yr metric above.",
+    )
+    if float(_goal_in) != _div_goal:
+        save_dividend_goal(float(_goal_in))
+        _div_goal = float(_goal_in)
+    if _div_goal > 0:
+        _div_pct = _dash_div / _div_goal
+        st.progress(min(_div_pct, 1.0))
+        if _div_pct >= 1.0:
+            st.write(f"**{money(_dash_div)} of {money(_div_goal)}/yr — {_div_pct:.0%} of goal. Goal reached.**")
+        else:
+            st.write(
+                f"**{money(_dash_div)} of {money(_div_goal)}/yr — {_div_pct:.0%} of goal** "
+                f"· {money(_div_goal - _dash_div)}/yr to go"
+            )
+    else:
+        st.caption("Set a goal above and this shows how close your current dividend income is to it.")
 
 
 # --- 1. Ticker Lookup ----------------------------------------------------
