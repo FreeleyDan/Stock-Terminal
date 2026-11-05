@@ -45,7 +45,6 @@ from storage import (
     last_saved_display,
     load_last_scan,
     load_user_data,
-    parse_imported_full,
     save_account_type,
     save_cash,
     save_last_scan,
@@ -1295,30 +1294,6 @@ with tab_portfolio:
             save_tax_rates(tax_rates["lt_pct"], tax_rates["st_pct"], tax_rates["ca_pct"])
     if not is_taxable_pf:
         st.caption("Estimated tax, wash-sale warnings, and rebalance tax costs appear only for Taxable portfolios. Long/short-term status is shown for any portfolio with a purchase date, since holding period is factual — sales inside an IRA are not taxed at sale, so no tax estimate is shown there.")
-
-    with st.expander("Import a portfolio file (JSON)", expanded=False):
-        st.caption("Import replaces ALL saved portfolios, watchlists, and notes with the file's contents. Export first if you want a backup. Manual dividend data is replaced only if the file contains it — otherwise your existing manual data is kept.")
-        uploaded_pf = st.file_uploader("Portfolio JSON file", type=["json"], key="pf_import_file")
-        if uploaded_pf is not None and st.button("Import this file", key="pf_import_btn"):
-            try:
-                imported_full = parse_imported_full(json.load(uploaded_pf))
-                existing_manual = (load_user_data().get("manual") or {}) if not imported_full["manual"] else imported_full["manual"]
-                full_data = load_user_data()
-                full_data["portfolios"] = imported_full["portfolios"]
-                full_data["watchlists"] = imported_full["watchlists"]
-                full_data["portfolio_cash"] = imported_full["portfolio_cash"]
-                full_data["notes"] = imported_full["notes"]
-                full_data["manual"] = existing_manual
-                save_user_data(full_data)
-                first_pf = next(iter(imported_full["portfolios"].keys()), "Main")
-                st.session_state["pf_selected_name"] = first_pf
-                for k in list(st.session_state.keys()):
-                    if k.startswith("portfolio_df_") or k.startswith("portfolio_saved_") or k.startswith("watchlist_df_") or k.startswith("watchlist_saved_"):
-                        st.session_state.pop(k, None)
-                st.success(f"Imported {len(imported_full['portfolios'])} portfolio(s) and {len(imported_full['watchlists'])} watchlist(s).")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Import failed: {e}")
 
     pf_df_key = f"portfolio_df_{pf_name}"
     pf_saved_key = f"portfolio_saved_{pf_name}"
