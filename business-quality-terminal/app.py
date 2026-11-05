@@ -28,7 +28,7 @@ import pandas as pd
 import streamlit as st
 
 from calculations import calculate_ddm_value, calculate_sticker_price
-from data_fetcher import _build_financial_history, clear_cache, fetch_raw_companyfacts, normalize_ticker
+from data_fetcher import _build_financial_history, clear_cache, fetch_raw_companyfacts, get_price_history, normalize_ticker
 from holdings import NON_13F, check_holdings
 from gatekeeper import BIG_FIVE_METRICS, HORIZONS
 from screener import big_five_pass_count, dividend_safety_score, rank_snapshots, scan_snapshots, stepped_rank_snapshots
@@ -584,6 +584,102 @@ def style_signal_column(df: pd.DataFrame):
     return apply_fn(color, subset=["Signal"])
 
 
+def _add_ticker_to_portfolio(ticker: str, pf_name: str) -> str:
+    """Add one ticker to a named portfolio, blank shares/cost for the
+    user to fill in on the Portfolio tab. Returns "added", "already",
+    or "failed". The cached portfolio editor frame is dropped so the
+    Portfolio tab rebuilds it from the saved file (the editor
+    auto-saves on every change, so no in-progress edit is lost)."""
+    ticker = normalize_ticker(ticker or "")
+    if not ticker:
+        return "failed"
+    data = load_user_data()
+    portfolios = dict(data.get("portfolios") or {})
+    holdings = list(portfolios.get(pf_name, []))
+    if any(normalize_ticker(h.get("ticker", "")) == ticker for h in holdings):
+        return "already"
+    holdings.append({"ticker": ticker, "shares": None, "avg_cost": None})
+    if not save_portfolio(holdings, name=pf_name):
+        return "failed"
+    st.session_state.pop(f"portfolio_df_{pf_name}", None)
+    st.session_state.pop(f"portfolio_saved_{pf_name}", None)
+    return "added"
+
+
+def _add_ticker_to_watchlist(ticker: str, wl_name: str) -> str:
+    """Add one ticker to a named watchlist. Returns "added", "already",
+    or "failed". Drops the cached watchlist editor frame so the
+    Watchlist tab rebuilds it from the saved file."""
+    ticker = normalize_ticker(ticker or "")
+    if not ticker:
+        return "failed"
+    data = load_user_data()
+    lists = dict(data.get("watchlists") or {})
+    wl = list(lists.get(wl_name, []))
+    if ticker in wl:
+        return "already"
+    wl.append(ticker)
+    if not save_watchlist(wl, name=wl_name):
+        return "failed"
+    st.session_state.pop(f"watchlist_df_{wl_name}", None)
+    st.session_state.pop(f"watchlist_saved_{wl_name}", None)
+    return "added"
+
+
+def _render_scan_diff(prev: Optional[Dict[str, float]], cur: Dict[str, float]) -> None:
+    """What changed since the last scan: new names in the top 25,
+    names that dropped out, and the biggest moves in % below Sticker.
+    `prev`/`cur` are {ticker: undervalued_pct} from the previous and
+    current scans, ranked with the same filters."""
+    if not prev:
+        return
+    new = [t for t in cur if t not in prev]
+    dropped = [t for t in prev if t not in cur]
+    movers = sorted(
+        ((t, cur[t] - prev[t]) for t in cur if t in prev and abs(cur[t] - prev[t]) >= 0.05),
+        key=lambda kv: -abs(kv[1]),
+    )[:5]
+    if not new and not dropped and not movers:
+        st.caption("No change since the last scan — same top 25.")
+        return
+    with st.expander("What changed since the last scan", expanded=False):
+        if new:
+            st.write("**New in the top 25:** " + ", ".join(f"{t} ({cur[t]:.1f}% below Sticker)" for t in new))
+        if dropped:
+            st.write("**Dropped out:** " + ", ".join(f"{t} (was {prev[t]:.1f}% below Sticker)" for t in dropped))
+        if movers:
+            st.write("**Biggest moves:** " + "; ".join(f"{t} {d:+.1f} pp" for t, d in movers))
+        st.caption("Compared with the top 25 from the previous scan, ranked with the same filters.")
+
+
+def _add_to_portfolio_controls(tickers: List[str], key_suffix: str) -> None:
+    """Ticker + portfolio pickers and an Add button, shared by the
+    Watchlist tab and the ranked (Top 25 / Dividend) tables."""
+    if not tickers:
+        return
+    data = load_user_data()
+    portfolio_names = list((data.get("portfolios") or {"Main": []}).keys()) or ["Main"]
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        pick_ticker = st.selectbox("Ticker", tickers, key=f"add_pf_ticker_{key_suffix}")
+    with c2:
+        pick_pf = st.selectbox("Add to portfolio", portfolio_names, key=f"add_pf_name_{key_suffix}")
+    with c3:
+        if st.button("Add to portfolio", key=f"add_pf_btn_{key_suffix}"):
+            result = _add_ticker_to_portfolio(pick_ticker, pick_pf)
+            if result == "added":
+                st.success(f"Added {pick_ticker} to '{pick_pf}' — set shares and cost on the Portfolio tab.")
+            elif result == "already":
+                st.warning(f"{pick_ticker} is already in '{pick_pf}'.")
+            else:
+                st.warning("Couldn't write user_data.json — changes won't persist after a restart.")
+
+
+def _pct_or_dash(v: Any) -> str:
+    return "\u2014" if v is None else f"{v:.1%}"
+
+
+
 def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str, Any]], max_growth: float, discount_rate: float = 0.15) -> None:
     st.subheader(ticker + (f" \u2014 {snap['name']}" if snap.get("name") else ""))
     if snap.get("error"):
@@ -649,6 +745,63 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
     if val["note"]:
         st.caption(val["note"])
     st.dataframe(build_checklist_dataframe(snap["gatekeeper"]), hide_index=True, use_container_width=True)
+
+    # One-tap add from the card, same as the tables: pick a portfolio /
+    # watchlist and the ticker lands there with blank shares/cost.
+    st.caption("Add this ticker to a portfolio or watchlist — shares and cost stay blank until you set them on the Portfolio tab.")
+    card_c1, card_c2 = st.columns(2)
+    with card_c1:
+        pf_names_card = list((load_user_data().get("portfolios") or {"Main": []}).keys()) or ["Main"]
+        pick_pf_card = st.selectbox("Portfolio", pf_names_card, key=f"card_pf_{ticker}")
+        if st.button("Add to portfolio", key=f"card_add_pf_{ticker}"):
+            card_pf_result = _add_ticker_to_portfolio(ticker, pick_pf_card)
+            if card_pf_result == "added":
+                st.success(f"Added {ticker} to '{pick_pf_card}'.")
+            elif card_pf_result == "already":
+                st.warning(f"{ticker} is already in '{pick_pf_card}'.")
+            else:
+                st.warning("Couldn't write user_data.json — changes won't persist after a restart.")
+    with card_c2:
+        wl_names_card = list((load_user_data().get("watchlists") or {"Main": []}).keys()) or ["Main"]
+        pick_wl_card = st.selectbox("Watchlist", wl_names_card, key=f"card_wl_{ticker}")
+        if st.button("Add to watchlist", key=f"card_add_wl_{ticker}"):
+            card_wl_result = _add_ticker_to_watchlist(ticker, pick_wl_card)
+            if card_wl_result == "added":
+                st.success(f"Added {ticker} to watchlist '{pick_wl_card}'.")
+            elif card_wl_result == "already":
+                st.warning(f"{ticker} is already in watchlist '{pick_wl_card}'.")
+            else:
+                st.warning("Couldn't write user_data.json — changes won't persist after a restart.")
+
+    # Price vs Sticker chart — lazy, so a lookup doesn't pay for a
+    # Yahoo history call it didn't ask for. Monthly closes (16 years is
+    # ~200 points, not ~4,000 daily), with today's Sticker and MOS as
+    # horizontal lines. The result is kept in session state for the
+    # ticker, so re-renders don't re-fetch.
+    if val and val.get("sticker_price") is not None:
+        chart_key = f"price_chart_{ticker}"
+        if st.button("Show price vs Sticker chart", key=f"chart_btn_{ticker}"):
+            with st.spinner("Fetching price history..."):
+                bundle, pstatus = get_price_history(ticker)
+            if bundle and bundle.get("closes"):
+                st.session_state[chart_key] = bundle["closes"]
+            else:
+                st.session_state[chart_key] = {"error": "Couldn't fetch price history"}
+        chart_closes = st.session_state.get(chart_key)
+        if isinstance(chart_closes, dict) and chart_closes.get("error"):
+            st.warning(str(chart_closes["error"]))
+        elif isinstance(chart_closes, dict) and chart_closes:
+            monthly: Dict[str, float] = {}
+            for d in sorted(chart_closes):
+                monthly[d[:7]] = chart_closes[d]
+            chart_frame = pd.DataFrame({"Price": list(monthly.values())}, index=pd.to_datetime(list(monthly.keys())))
+            chart_frame["Sticker"] = val["sticker_price"]
+            chart_frame["MOS Price"] = val["margin_of_safety_price"]
+            st.line_chart(chart_frame)
+            st.caption(
+                "Monthly closes (split-adjusted, not dividend-adjusted). Sticker and MOS lines are today's values, "
+                "not historical — the chart shows where price has been relative to today's buy levels."
+            )
 
     # Deterioration flags: trend prompts, not sell signals on their own.
     det_flags = _deterioration_flags(snap)
@@ -849,11 +1002,49 @@ with tab_lookup:
     lookup_to_fetch = st.session_state.get("lookup_requested", [])
     if not lookup_to_fetch:
         st.info("Enter one or more tickers in the sidebar, then click Fetch tickers.")
+    fetched_snaps: Dict[str, Any] = {}
     for ticker in lookup_to_fetch:
         with st.spinner(f"Fetching {ticker}..."):
             snap = build_snapshot(ticker, price_max_age=LOOKUP_PRICE_MAX_AGE)
         val = None if snap.get("error") else valuation_from_snapshot(snap, discount_rate, max_growth)
+        fetched_snaps[ticker] = snap
         render_ticker_card(ticker, snap, val, max_growth, discount_rate)
+    # Side-by-side compare: same numbers, one table, up to 4 tickers.
+    comparable = [t for t, s in fetched_snaps.items() if not s.get("error")]
+    if len(comparable) >= 2:
+        st.subheader("Compare tickers")
+        compare_picks = st.multiselect(
+            "Pick 2–4 tickers to compare", comparable, default=comparable[:4], max_selections=4, key="compare_picks"
+        )
+        if len(compare_picks) >= 2:
+            compare_rows: List[Dict[str, Any]] = []
+            for label, fmt in [
+                ("Price", lambda s, v: money(s.get("current_price"))),
+                ("Sticker Price", lambda s, v: money(v.get("sticker_price")) if v else "—"),
+                ("MOS Price", lambda s, v: money(v.get("margin_of_safety_price")) if v else "—"),
+                ("% Below Sticker", lambda s, v: "—" if v is None or v.get("undervalued_pct") is None else f"{v['undervalued_pct']:.1f}%"),
+                ("Growth Used", lambda s, v: "—" if v is None or v.get("growth_used") is None else f"{v['growth_used']:.1%}"),
+                ("Historical P/E", lambda s, v: "—" if s.get("historical_pe") is None else f"{s['historical_pe']:.1f}"),
+                ("Moat Score", lambda s, v: str(s.get("moat_score"))),
+                ("Big Five passes", lambda s, v: f"{big_five_pass_count(s, 0.10)}/5"),
+                ("Dividend streak (yrs)", lambda s, v: str(s.get("dividend_streak") or 0)),
+                ("Dividend yield", lambda s, v: _pct_or_dash(s.get("dividend_yield"))),
+                ("Payout ratio", lambda s, v: _pct_or_dash(s.get("payout_ratio"))),
+                ("Market cap", lambda s, v: _format_market_cap(_market_cap(s))),
+                ("PEG", lambda s, v: "—" if _peg_ratio(s) is None else f"{_peg_ratio(s):.2f}"),
+                ("Owner earnings yield", lambda s, v: "—" if _owner_earnings_yield(s) is None else f"{_owner_earnings_yield(s):.1%}"),
+                ("Signal (Moat ≥60, near-buy 15%)", lambda s, v: buy_signal(s, v, 60.0, 15.0)["signal"] if v else "—"),
+            ]:
+                row: Dict[str, Any] = {"Metric": label}
+                for t in compare_picks:
+                    s = fetched_snaps[t]
+                    v = valuation_from_snapshot(s, discount_rate, max_growth)
+                    row[t] = fmt(s, v)
+                compare_rows.append(row)
+            st.dataframe(pd.DataFrame(compare_rows), hide_index=True, use_container_width=True)
+            st.caption("Signal uses the watchlist defaults (Moat ≥60, near-buy band 15%) for all tickers, so the comparison is apples-to-apples.")
+        elif compare_picks:
+            st.info("Pick at least 2 tickers to compare.")
 
 
 # --- 2. Portfolio ---------------------------------------------------------
@@ -1589,55 +1780,6 @@ with tab_watchlist:
 
 
 # --- 4 & 5. Market scanner --------------------------------------------------
-def _add_ticker_to_portfolio(ticker: str, pf_name: str) -> str:
-    """Add one ticker to a named portfolio, blank shares/cost for the
-    user to fill in on the Portfolio tab. Returns "added", "already",
-    or "failed". The cached portfolio editor frame is dropped so the
-    Portfolio tab rebuilds it from the saved file (the editor
-    auto-saves on every change, so no in-progress edit is lost)."""
-    ticker = normalize_ticker(ticker or "")
-    if not ticker:
-        return "failed"
-    data = load_user_data()
-    portfolios = dict(data.get("portfolios") or {})
-    holdings = list(portfolios.get(pf_name, []))
-    if any(normalize_ticker(h.get("ticker", "")) == ticker for h in holdings):
-        return "already"
-    holdings.append({"ticker": ticker, "shares": None, "avg_cost": None})
-    if not save_portfolio(holdings, name=pf_name):
-        return "failed"
-    st.session_state.pop(f"portfolio_df_{pf_name}", None)
-    st.session_state.pop(f"portfolio_saved_{pf_name}", None)
-    return "added"
-
-
-def _add_to_portfolio_controls(tickers: List[str], key_suffix: str) -> None:
-    """Ticker + portfolio pickers and an Add button, shared by the
-    Watchlist tab and the ranked (Top 25 / Dividend) tables."""
-    if not tickers:
-        return
-    data = load_user_data()
-    portfolio_names = list((data.get("portfolios") or {"Main": []}).keys()) or ["Main"]
-    c1, c2, c3 = st.columns([2, 2, 1])
-    with c1:
-        pick_ticker = st.selectbox("Ticker", tickers, key=f"add_pf_ticker_{key_suffix}")
-    with c2:
-        pick_pf = st.selectbox("Add to portfolio", portfolio_names, key=f"add_pf_name_{key_suffix}")
-    with c3:
-        if st.button("Add to portfolio", key=f"add_pf_btn_{key_suffix}"):
-            result = _add_ticker_to_portfolio(pick_ticker, pick_pf)
-            if result == "added":
-                st.success(f"Added {pick_ticker} to '{pick_pf}' — set shares and cost on the Portfolio tab.")
-            elif result == "already":
-                st.warning(f"{pick_ticker} is already in '{pick_pf}'.")
-            else:
-                st.warning("Couldn't write user_data.json — changes won't persist after a restart.")
-
-
-def _pct_or_dash(v: Any) -> str:
-    return "\u2014" if v is None else f"{v:.1%}"
-
-
 def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat: float, quality_first: bool = True, download_key: str = "scan_csv", dividend_mode: bool = False, max_payout: Optional[float] = None, min_div_growth: Optional[float] = None, min_chowder: Optional[float] = None, min_market_cap_b: float = 0.0) -> None:
     # Dividend tab only (Miller / Van Knapp layer): filter snapshots
     # before ranking. A missing metric is shown as "—" and does NOT
@@ -1868,6 +2010,7 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
     if ranked["top_results"]:
         st.caption("Add a result to a portfolio — shares and cost stay blank until you set them on the Portfolio tab.")
         _add_to_portfolio_controls([r["ticker"] for r in ranked["top_results"]], download_key)
+    return ranked
 
 
 with tab_undervalued:
@@ -1929,6 +2072,14 @@ with tab_undervalued:
                 partial_with_label["label"] = choice
                 save_last_scan(partial_with_label)
 
+            # Keep the top 25 the user was looking at, so the diff below
+            # can compare the new scan against it (same filters, new data).
+            # prev_top25 is refreshed after every render of the Top 25
+            # tab, so it always holds the list as last displayed.
+            if st.session_state.get("prev_top25"):
+                st.session_state["scan_diff_prev"] = dict(st.session_state["prev_top25"])
+            else:
+                st.session_state.pop("scan_diff_prev", None)
             result = scan_snapshots(universe, progress_callback=on_progress, partial_callback=on_partial)
             bar.empty()
             status.empty()
@@ -1963,7 +2114,11 @@ with tab_undervalued:
         min_cap_scan = float(uv_p.get("min_cap_b", 0))
         st.caption(f"Using preset '{uv_preset_name}' — sliders are ignored until you switch back to (sliders).")
     if "scan" in st.session_state:
-        render_ranked_table(st.session_state["scan"], 0, float(min_moat_scan), quality_first=quality_first_scan, download_key="scan_csv", min_market_cap_b=float(min_cap_scan))
+        ranked_now = render_ranked_table(st.session_state["scan"], 0, float(min_moat_scan), quality_first=quality_first_scan, download_key="scan_csv", min_market_cap_b=float(min_cap_scan))
+        # Refresh the stored top 25 for the next scan's diff, then show
+        # the diff against the previous scan (if this session has one).
+        st.session_state["prev_top25"] = {r["ticker"]: r["undervalued_pct"] for r in ranked_now["top_results"]}
+        _render_scan_diff(st.session_state.get("scan_diff_prev"), st.session_state["prev_top25"])
     else:
         st.info("Pick a universe and click Scan.")
 
