@@ -78,7 +78,6 @@ from storage import (
     load_user_data,
     save_account_type,
     save_cash,
-    save_dividend_goal,
     save_last_scan,
     save_manual,
     save_note,
@@ -90,6 +89,18 @@ from storage import (
 )
 from universe import get_all_us_listed_tickers, get_sp500_tickers
 from valuation import DEFAULT_MAX_GROWTH_RATE, build_snapshot, valuation_from_snapshot
+
+try:
+    from storage import save_dividend_goal
+except ImportError:  # deployed storage.py can lag the repo behind app.py
+    def save_dividend_goal(goal: float) -> bool:
+        """Local copy of storage.save_dividend_goal, used only when the
+        deployed storage.py predates it — so a stale deploy can never
+        break app startup again. load/save with no path use storage's
+        own default file, the same one the real function uses."""
+        _data = load_user_data()
+        _data["dividend_income_goal"] = max(0.0, float(goal or 0.0))
+        return save_user_data(_data)
 
 st.set_page_config(page_title="Business Quality Terminal", layout="wide")
 
