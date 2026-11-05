@@ -111,13 +111,23 @@ except ImportError:  # deployed storage.py can lag the repo behind app.py
         _data["dividend_watch"] = watch or {}
         return save_user_data(_data)
 
-    def record_dividend_goal_month(month: str, income: float, goal: float) -> bool:
+    def record_dividend_goal_month(month: str, income: float, goal: float, buys: float = 0.0, raises: float = 0.0) -> bool:
         """Local copy of storage.record_dividend_goal_month (see above)."""
         _data = load_user_data()
         _history = [e for e in (_data.get("dividend_goal_history") or []) if e.get("month") != month]
-        _history.append({"month": month, "income": max(0.0, float(income or 0.0)), "goal": max(0.0, float(goal or 0.0))})
+        _history.append({"month": month, "income": max(0.0, float(income or 0.0)), "goal": max(0.0, float(goal or 0.0)),
+                         "buys": float(buys or 0.0), "raises": float(raises or 0.0)})
         _history.sort(key=lambda e: e.get("month", ""))
         _data["dividend_goal_history"] = _history[-24:]
+        return save_user_data(_data)
+
+try:
+    from storage import save_holdings_baseline
+except ImportError:  # deployed storage.py can lag the repo behind app.py
+    def save_holdings_baseline(baseline: Dict[str, Any]) -> bool:
+        """Local copy of storage.save_holdings_baseline (see above)."""
+        _data = load_user_data()
+        _data["holdings_baseline"] = baseline or {}
         return save_user_data(_data)
 
 st.set_page_config(page_title="Business Quality Terminal", layout="wide")
@@ -203,6 +213,17 @@ def _num(value: Any) -> Optional[float]:
 
 def money(value: Optional[float]) -> str:
     return "\u2014" if value is None else f"${value:,.2f}"
+
+
+def _signed_money(value: Optional[float]) -> str:
+    """$1,234.56 with an explicit +/\u2212 sign (for income attribution)."""
+    if value is None:
+        return "\u2014"
+    if value > 0:
+        return f"+${value:,.2f}"
+    if value < 0:
+        return f"\u2212${abs(value):,.2f}"
+    return "$0.00"
 
 
 def status_icon(status: str) -> str:
@@ -652,6 +673,53 @@ def _years_to_goal(items: List[Dict[str, Any]], goal: float, current_income: flo
         if _projected_income_at_year(items, _y) >= goal:
             return (_y, _rate)
     return (None, _rate)
+
+
+def _income_attribution(shares_now: Any, dps_now: Any, shares_prev: Any, dps_prev: Any, split_ratio: float = 1.0) -> Any:
+    """Split an income change into new shares vs dividend raises ($/yr).
+    income = shares x DPS, so the change is (new shares x old DPS) + (all
+    shares x DPS change). The previous shares/DPS are split-adjusted, so
+    a split alone attributes $0 to both. Returns (buys, raises); (0, 0)
+    on first sighting (no baseline) or missing data. New shares includes
+    DRIP reinvestment on DRIP holdings — the app cannot tell a DRIP share
+    from a bought share by count alone."""
+    if shares_now is None or dps_now is None or shares_prev is None or dps_prev is None:
+        return (0.0, 0.0)
+    _prev_shares = shares_prev * split_ratio
+    _prev_dps = dps_prev / split_ratio if split_ratio else dps_prev
+    _buys = (shares_now - _prev_shares) * _prev_dps
+    _raises = shares_now * (dps_now - _prev_dps)
+    return (_buys, _raises)
+
+
+def _observed_income_growth(history: List[Dict[str, Any]]) -> Optional[float]:
+    """Median month-over-month income growth from the goal history,
+    annualized and capped at 50%/yr. Needs at least 2 usable steps, so
+    one big first month (e.g. entering the starting portfolio) cannot
+    set the pace. None when there is not enough history yet."""
+    _rates: List[float] = []
+    for _a, _b in zip(history, history[1:]):
+        _ia, _ib = _a.get("income") or 0.0, _b.get("income") or 0.0
+        if _ia > 0 and _ib > 0:
+            _rates.append(_ib / _ia - 1.0)
+    if len(_rates) < 2:
+        return None
+    _med = statistics.median(_rates)
+    if _med <= 0:
+        return None
+    return min((1.0 + _med) ** 12 - 1.0, 0.50)
+
+
+def _years_to_goal_observed(current_income: float, goal: float, annual_rate: Optional[float]) -> Optional[int]:
+    """Years to goal at an observed annual income growth rate (buys +
+    raises + DRIP together). 0 when already at goal, None when the rate
+    is missing/zero or the goal is 50+ years out."""
+    if current_income >= goal:
+        return 0
+    if not annual_rate or annual_rate <= 0:
+        return None
+    _y = math.log(goal / current_income) / math.log(1.0 + annual_rate)
+    return math.ceil(_y) if _y <= 50 else None
 
 
 def _dividend_payment_cut(payments: Any) -> Optional[str]:
@@ -1246,6 +1314,10 @@ with tab_dashboard:
     _dash_watch: Dict[str, Any] = dict(_dash_data.get("dividend_watch") or {})
     _dash_watch_changed = False
     _dash_has_cut = False
+    _dash_baseline: Dict[str, Any] = dict(_dash_data.get("holdings_baseline") or {})
+    _dash_baseline_changed = False
+    _dash_attr_buys = 0.0
+    _dash_attr_raises = 0.0
     if not any(_dash_portfolios.values()) and not any(_dash_watchlists.values()):
         st.info("Nothing to summarize yet — add a holding on the Portfolio tab or a ticker on the Watchlist tab.")
     else:
@@ -1325,6 +1397,28 @@ with tab_dashboard:
                     if _prev_watch is None or _prev_watch.get("payout") != _new_watch["payout"]:
                         _dash_watch[_h["ticker"]] = _new_watch
                         _dash_watch_changed = True
+                    # Income attribution: compare this holding against its
+                    # stored baseline (first sighting just sets it).
+                    # Splits since the baseline are adjusted out.
+                    _prev_base = _dash_baseline.get(_h["ticker"])
+                    _base_date = (_prev_base or {}).get("date")
+                    _split_ratio = 1.0
+                    if _base_date:
+                        for _sp in _splits_after_purchase(_snap.get("splits"), _base_date):
+                            _split_ratio *= _sp["ratio"]
+                    _attr_b, _attr_r = _income_attribution(
+                        _h.get("shares"), _dps_dash,
+                        (_prev_base or {}).get("shares"), (_prev_base or {}).get("dps"),
+                        _split_ratio,
+                    )
+                    _dash_attr_buys += _attr_b
+                    _dash_attr_raises += _attr_r
+                    _new_base = {"shares": _h.get("shares"), "dps": _dps_dash, "income": _div_dash,
+                                 "date": datetime.now().strftime("%Y-%m-%d")}
+                    if (_prev_base is None or _prev_base.get("shares") != _new_base["shares"]
+                            or _prev_base.get("dps") != _new_base["dps"]):
+                        _dash_baseline[_h["ticker"]] = _new_base
+                        _dash_baseline_changed = True
                     if _sig["signal"] in ("SELL", "REVIEW"):
                         _attention.append({
                             "Where": _pf_name, "Ticker": _h["ticker"], "Signal": _sig["signal"],
@@ -1359,6 +1453,8 @@ with tab_dashboard:
                         })
         if _dash_watch_changed:
             save_dividend_watch(_dash_watch)
+        if _dash_baseline_changed:
+            save_holdings_baseline(_dash_baseline)
         _m1, _m2, _m3, _m4 = st.columns(4)
         with _m1:
             st.metric("Total account value", money(_dash_value + _dash_cash_total))
@@ -1418,24 +1514,39 @@ with tab_dashboard:
             )
     else:
         st.caption("Set a goal above and this shows how close your current dividend income is to it.")
-    if _dash_checked > 0 and _div_goal > 0 and _dash_div < _div_goal:
-        _yrs, _rate = _years_to_goal(_dash_div_items, _div_goal, _dash_div)
-        if _yrs is not None:
-            _rate_txt = f" (dividends growing ~{_rate:.1%}/yr)" if _rate is not None else ""
-            st.write(f"Roughly **{_yrs} year{'s' if _yrs != 1 else ''}** to reach the goal at the current pace{_rate_txt}.")
-            st.caption("Estimate only: assumes dividend growth continues, no new money in or out, and flat prices for DRIP reinvestment.")
-        elif _rate is not None:
-            st.write("50+ years to reach the goal at the current pace — growth is too slow to get there soon.")
-        else:
-            st.write("Not on pace at current growth — no holding has a dividend growth rate to project from, so income stays flat.")
     if _dash_checked > 0:
         _hist_month = datetime.now().strftime("%Y-%m")
+        _stored_month = next((e for e in (_dash_data.get("dividend_goal_history") or []) if e.get("month") == _hist_month), None)
+        _month_buys = (float((_stored_month or {}).get("buys") or 0.0) + _dash_attr_buys)
+        _month_raises = (float((_stored_month or {}).get("raises") or 0.0) + _dash_attr_raises)
         _history = list(_dash_data.get("dividend_goal_history") or [])
         _history = [e for e in _history if e.get("month") != _hist_month]
-        _history.append({"month": _hist_month, "income": _dash_div, "goal": _div_goal})
+        _history.append({"month": _hist_month, "income": _dash_div, "goal": _div_goal, "buys": _month_buys, "raises": _month_raises})
         _history.sort(key=lambda e: e.get("month", ""))
         _history = _history[-24:]
-        record_dividend_goal_month(_hist_month, _dash_div, _div_goal)
+        record_dividend_goal_month(_hist_month, _dash_div, _div_goal, buys=_month_buys, raises=_month_raises)
+        if _div_goal > 0 and _dash_div < _div_goal:
+            _obs_rate = _observed_income_growth(_history)
+            if _obs_rate is not None:
+                _yrs_obs = _years_to_goal_observed(_dash_div, _div_goal, _obs_rate)
+                if _yrs_obs is not None:
+                    st.write(f"Roughly **{_yrs_obs} year{'s' if _yrs_obs != 1 else ''}** to reach the goal at your actual pace (~{_obs_rate:.0%}/yr income growth over the last {len(_history)} months).")
+                else:
+                    st.write("50+ years to reach the goal at your actual pace — growth is too slow to get there soon.")
+                st.caption("Estimate only: your actual pace includes weekly buys, raises, and DRIP, so it changes as you do.")
+            else:
+                _yrs, _rate = _years_to_goal(_dash_div_items, _div_goal, _dash_div)
+                if _yrs is not None:
+                    _rate_txt = f" (dividends growing ~{_rate:.1%}/yr)" if _rate is not None else ""
+                    st.write(f"Roughly **{_yrs} year{'s' if _yrs != 1 else ''}** to reach the goal at the current pace{_rate_txt}.")
+                    st.caption("Estimate only: assumes dividend growth continues, no new money in or out, and flat prices for DRIP reinvestment. Once there are a few months of history, this switches to your actual pace.")
+                elif _rate is not None:
+                    st.write("50+ years to reach the goal at the current pace — growth is too slow to get there soon.")
+                else:
+                    st.write("Not on pace at current growth — no holding has a dividend growth rate to project from, so income stays flat.")
+        if _month_buys or _month_raises:
+            st.write(f"This month: {_signed_money(_month_buys)} from new shares · {_signed_money(_month_raises)} from dividend raises")
+            st.caption("New shares includes DRIP reinvestment on DRIP holdings — the app cannot tell a DRIP share from a bought share by count alone.")
         if len(_history) >= 2:
             _hist_df = pd.DataFrame(_history).set_index("month")
             _hist_cols = ["income"] + (["goal"] if any(e.get("goal") for e in _history) else [])

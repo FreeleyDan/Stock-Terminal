@@ -339,13 +339,20 @@ check("dividend watch round-trips", d.get("dividend_watch"), {"KO": {"payout": 0
 check("record goal month", storage.record_dividend_goal_month("2026-11", 5000.0, 12000.0, path=p))
 check("record same month twice keeps one entry, latest wins",
       storage.record_dividend_goal_month("2026-11", 5200.0, 12000.0, path=p) and storage.load_user_data(p).get("dividend_goal_history"),
-      [{"month": "2026-11", "income": 5200.0, "goal": 12000.0}])
+      [{"month": "2026-11", "income": 5200.0, "goal": 12000.0, "buys": 0.0, "raises": 0.0}])
 _months = [f"2024-{m:02d}" for m in range(1, 13)] + [f"2025-{m:02d}" for m in range(1, 13)] + ["2026-01"]
 for _m in _months:
     storage.record_dividend_goal_month(_m, 100.0, 12000.0, path=p)
 d = storage.load_user_data(p)
 check("goal history keeps only the last 24 months", len(d.get("dividend_goal_history")), 24)
 check("goal history drops the oldest months", d["dividend_goal_history"][0]["month"], "2024-03")
+check("save holdings baseline", storage.save_holdings_baseline({"KO": {"shares": 100.0, "dps": 2.0, "income": 200.0, "date": "2026-11-05"}}, path=p))
+d = storage.load_user_data(p)
+check("holdings baseline round-trips", d.get("holdings_baseline"), {"KO": {"shares": 100.0, "dps": 2.0, "income": 200.0, "date": "2026-11-05"}})
+check("record goal month with attribution",
+      storage.record_dividend_goal_month("2026-11", 5200.0, 12000.0, buys=300.0, raises=50.0, path=p)
+      and storage.load_user_data(p).get("dividend_goal_history")[-1],
+      {"month": "2026-11", "income": 5200.0, "goal": 12000.0, "buys": 300.0, "raises": 50.0})
 
 # --------------------------------------------------------------------------
 section("Scanner")

@@ -109,11 +109,15 @@ def main():
     tree = ast.parse(src)
     wanted = {"_parse_purchase_date", "_audit_table_rows", "_splits_after_purchase",
               "_project_drip_income", "_projected_income_at_year", "_years_to_goal",
-              "_dividend_payment_cut", "_payout_jump_check"}
+              "_dividend_payment_cut", "_payout_jump_check",
+              "_income_attribution", "_observed_income_growth", "_years_to_goal_observed"}
+    import statistics as _statistics
+    import math as _math
     ns: Dict[str, Any] = {
         "median_yoy_growth": median_yoy_growth,
         "List": List, "Dict": Dict, "Optional": Optional, "Any": Any,
         "date": _date, "datetime": _datetime,
+        "statistics": _statistics, "math": _math,
     }
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in wanted:
@@ -128,6 +132,31 @@ def main():
     m._years_to_goal = ns["_years_to_goal"]
     m._dividend_payment_cut = ns["_dividend_payment_cut"]
     m._payout_jump_check = ns["_payout_jump_check"]
+    m._income_attribution = ns["_income_attribution"]
+    m._observed_income_growth = ns["_observed_income_growth"]
+    m._years_to_goal_observed = ns["_years_to_goal_observed"]
+    # Income attribution: buys + raises must sum to the income change.
+    _b, _r = m._income_attribution(110.0, 2.0, 100.0, 2.0)
+    assert (_b, _r) == (20.0, 0.0), (_b, _r)
+    _b, _r = m._income_attribution(100.0, 2.2, 100.0, 2.0)
+    assert abs(_b) < 1e-9 and abs(_r - 20.0) < 1e-9, (_b, _r)
+    _b, _r = m._income_attribution(100.0, 1.8, 100.0, 2.0)
+    assert abs(_b) < 1e-9 and abs(_r + 20.0) < 1e-9, (_b, _r)
+    _b, _r = m._income_attribution(200.0, 1.0, 100.0, 2.0, split_ratio=2.0)
+    assert (_b, _r) == (0.0, 0.0), (_b, _r)
+    assert m._income_attribution(100.0, 2.0, None, None) == (0.0, 0.0), "first sighting -> no attribution"
+    # Observed growth: median MoM, annualized, capped at 50%.
+    assert m._observed_income_growth([{"income": 1000.0}, {"income": 1010.0}, {"income": 1020.1}]) is not None
+    _obs = m._observed_income_growth([{"income": 1000.0}, {"income": 1010.0}, {"income": 1020.1}])
+    assert abs(_obs - 0.1268) < 0.001, _obs
+    assert m._observed_income_growth([{"income": 1000.0}, {"income": 1100.0}, {"income": 1210.0}]) == 0.50, "10%/mo caps at 50%/yr"
+    assert m._observed_income_growth([{"income": 1000.0}, {"income": 1100.0}]) is None, "one step is not enough"
+    assert m._observed_income_growth([{"income": 1000.0}]) is None, "one point is not enough"
+    # Years to goal at an observed rate.
+    assert m._years_to_goal_observed(1000.0, 2000.0, 0.10) == 8, "10%/yr doubles in ~8 years"
+    assert m._years_to_goal_observed(1000.0, 900.0, 0.10) == 0, "already at goal"
+    assert m._years_to_goal_observed(1000.0, 2000.0, None) is None, "no rate -> no projection"
+    assert m._years_to_goal_observed(1000.0, 2000.0, 0.0) is None, "zero rate -> no projection"
     # Years to goal: $1,000 growing at 10% reaches $2,000 in 8 years
     # (1.1^7 = 1.95x, 1.1^8 = 2.14x); DRIP gets there sooner; flat stays put.
     _grow = [{"income": 1000.0, "dps": 2.0, "dgr": 0.10, "price": 50.0, "shares": 500.0, "drip": False}]

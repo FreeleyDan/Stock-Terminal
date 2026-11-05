@@ -56,6 +56,7 @@ def _empty() -> Dict[str, Any]:
         "tax_rates": {"lt_pct": 0.0, "st_pct": 0.0, "ca_pct": 0.0}, "sales_log": [],
         "dividend_income_goal": 0.0,
         "dividend_watch": {}, "dividend_goal_history": [],
+        "holdings_baseline": {},
     }
 
 
@@ -209,9 +210,31 @@ def _clean_dividend_goal_history(raw_history: Any) -> List[Dict[str, Any]]:
             "month": month,
             "income": _to_float(entry.get("income")) or 0.0,
             "goal": _to_float(entry.get("goal")) or 0.0,
+            "buys": _to_float(entry.get("buys")) or 0.0,
+            "raises": _to_float(entry.get("raises")) or 0.0,
         })
     history.sort(key=lambda e: e.get("month", ""))
     return history[-24:]
+
+
+def _clean_holdings_baseline(raw_baseline: Any) -> Dict[str, Any]:
+    """Validate the last-seen holdings state used to attribute income
+    changes: one entry per ticker with shares, DPS, income and the date
+    it was seen."""
+    baseline: Dict[str, Any] = {}
+    if not isinstance(raw_baseline, dict):
+        return baseline
+    for ticker, entry in raw_baseline.items():
+        clean_ticker = normalize_ticker(ticker or "")
+        if not clean_ticker or not isinstance(entry, dict):
+            continue
+        baseline[clean_ticker] = {
+            "shares": _to_float(entry.get("shares")),
+            "dps": _to_float(entry.get("dps")),
+            "income": _to_float(entry.get("income")),
+            "date": _parse_date(entry.get("date")),
+        }
+    return baseline
 
 
 def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
@@ -306,6 +329,7 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
         "dividend_income_goal": _to_float(data.get("dividend_income_goal")) or 0.0,
         "dividend_watch": _clean_dividend_watch(data.get("dividend_watch")),
         "dividend_goal_history": _clean_dividend_goal_history(data.get("dividend_goal_history")),
+        "holdings_baseline": _clean_holdings_baseline(data.get("holdings_baseline")),
         "notes": notes, "manual": _clean_manual(data.get("manual", {})),
     }
 
@@ -435,13 +459,22 @@ def save_dividend_watch(watch: Dict[str, Any], path: str = DATA_FILE) -> bool:
     return save_user_data(data, path)
 
 
-def record_dividend_goal_month(month: str, income: float, goal: float, path: str = DATA_FILE) -> bool:
-    """Upsert one monthly income-vs-goal point (one entry per month, latest wins); keeps the last 24 months."""
+def record_dividend_goal_month(month: str, income: float, goal: float, buys: float = 0.0, raises: float = 0.0, path: str = DATA_FILE) -> bool:
+    """Upsert one monthly income-vs-goal point (one entry per month, latest wins); keeps the last 24 months.
+    buys/raises split the month's income change into new shares vs dividend raises ($/yr)."""
     data = load_user_data(path)
     history = [e for e in (data.get("dividend_goal_history") or []) if e.get("month") != month]
-    history.append({"month": month, "income": max(0.0, float(income or 0.0)), "goal": max(0.0, float(goal or 0.0))})
+    history.append({"month": month, "income": max(0.0, float(income or 0.0)), "goal": max(0.0, float(goal or 0.0)),
+                    "buys": float(buys or 0.0), "raises": float(raises or 0.0)})
     history.sort(key=lambda e: e.get("month", ""))
     data["dividend_goal_history"] = history[-24:]
+    return save_user_data(data, path)
+
+
+def save_holdings_baseline(baseline: Dict[str, Any], path: str = DATA_FILE) -> bool:
+    """Save the last-seen holdings state used to attribute income changes."""
+    data = load_user_data(path)
+    data["holdings_baseline"] = baseline or {}
     return save_user_data(data, path)
 
 
