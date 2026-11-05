@@ -1,0 +1,25 @@
+name: Tests
+
+# Runs on every push and pull request so a broken change (e.g. the
+# 2026-11-04 portfolio/widget bug) is caught here, not on Streamlit.
+# All tests are offline (mocked SEC/Yahoo) — no network calls, no secrets.
+on: [push, pull_request]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r business-quality-terminal/requirements.txt
+      - name: Compile all modules
+        run: python3 -m py_compile business-quality-terminal/*.py
+      - name: Run offline tests
+        working-directory: business-quality-terminal
+        run: |
+          python3 test_all.py
+          python3 test_synthetic.py
+          python3 test_tag_roic.py
