@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import statistics
 from collections import Counter
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -27,7 +28,37 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
-from calculations import calculate_ddm_value, calculate_sticker_price, median_yoy_growth
+from calculations import calculate_ddm_value, calculate_sticker_price
+
+try:
+    from calculations import median_yoy_growth
+except ImportError:  # deployed calculations.py can lag the repo behind app.py
+    def median_yoy_growth(series_by_date: Dict[str, float]) -> Optional[float]:
+        """
+        Median year-over-year growth across consecutive fiscal year-ends.
+
+        Local copy of calculations.median_yoy_growth, used only when the
+        deployed calculations.py predates it — so a stale deploy can never
+        break app startup again. Display only: it never feeds the Sticker,
+        Moat, or a signal.
+        """
+        try:
+            dated: List[tuple] = []
+            for end, val in (series_by_date or {}).items():
+                y, m, d = (int(x) for x in str(end).split("-"))
+                dated.append((date(y, m, d), float(val)))
+            dated.sort()
+            steps: List[float] = []
+            for (d1, v1), (d2, v2) in zip(dated, dated[1:]):
+                days = (d2 - d1).days
+                if days < 200 or days > 550 or v1 <= 0 or v2 <= 0:
+                    continue
+                steps.append((v2 / v1) ** (365.25 / days) - 1.0)
+            if len(steps) < 2:
+                return None
+            return statistics.median(steps)
+        except (TypeError, ValueError):
+            return None
 from data_fetcher import _build_financial_history, clear_cache, fetch_raw_companyfacts, get_price_history, normalize_ticker
 from holdings import NON_13F, check_holdings
 from gatekeeper import BIG_FIVE_METRICS, HORIZONS
