@@ -55,6 +55,7 @@ def _empty() -> Dict[str, Any]:
         "signal_log": [], "portfolio_account_types": {"Main": "Not set"},
         "tax_rates": {"lt_pct": 0.0, "st_pct": 0.0, "ca_pct": 0.0}, "sales_log": [],
         "dividend_income_goal": 0.0,
+        "dividend_watch": {}, "dividend_goal_history": [],
     }
 
 
@@ -174,6 +175,45 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
+def _clean_dividend_watch(raw_watch: Any) -> Dict[str, Any]:
+    """Validate the payout baselines for the dividend-cut watch: one entry
+    per ticker with the last seen payout ratio and the date it was set.
+    (Dividend cuts themselves are judged from the actual payment history
+    in the snapshot, not from this baseline.)"""
+    watch: Dict[str, Any] = {}
+    if not isinstance(raw_watch, dict):
+        return watch
+    for ticker, entry in raw_watch.items():
+        clean_ticker = normalize_ticker(ticker or "")
+        if not clean_ticker or not isinstance(entry, dict):
+            continue
+        watch[clean_ticker] = {
+            "payout": _to_float(entry.get("payout")),
+            "date": _parse_date(entry.get("date")),
+        }
+    return watch
+
+
+def _clean_dividend_goal_history(raw_history: Any) -> List[Dict[str, Any]]:
+    """Validate the monthly income-vs-goal log: one entry per YYYY-MM month."""
+    history: List[Dict[str, Any]] = []
+    if not isinstance(raw_history, list):
+        return history
+    for entry in raw_history:
+        if not isinstance(entry, dict):
+            continue
+        month = str(entry.get("month", ""))[:7]
+        if len(month) != 7 or month[4] != "-":
+            continue
+        history.append({
+            "month": month,
+            "income": _to_float(entry.get("income")) or 0.0,
+            "goal": _to_float(entry.get("goal")) or 0.0,
+        })
+    history.sort(key=lambda e: e.get("month", ""))
+    return history[-24:]
+
+
 def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
     """Never raises. A corrupt file is moved aside (.corrupt) and replaced
     by an empty one rather than crashing the app."""
@@ -264,6 +304,8 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
         "scan_presets": presets, "signal_log": log,
         "portfolio_account_types": account_types, "tax_rates": tax_rates, "sales_log": sales,
         "dividend_income_goal": _to_float(data.get("dividend_income_goal")) or 0.0,
+        "dividend_watch": _clean_dividend_watch(data.get("dividend_watch")),
+        "dividend_goal_history": _clean_dividend_goal_history(data.get("dividend_goal_history")),
         "notes": notes, "manual": _clean_manual(data.get("manual", {})),
     }
 
@@ -383,6 +425,23 @@ def save_dividend_goal(goal: float, path: str = DATA_FILE) -> bool:
     """Save the annual dividend income goal ($/yr) tracked on the Dashboard."""
     data = load_user_data(path)
     data["dividend_income_goal"] = max(0.0, float(goal or 0.0))
+    return save_user_data(data, path)
+
+
+def save_dividend_watch(watch: Dict[str, Any], path: str = DATA_FILE) -> bool:
+    """Save the dividend-watch payout baselines (last seen payout ratio per ticker)."""
+    data = load_user_data(path)
+    data["dividend_watch"] = watch or {}
+    return save_user_data(data, path)
+
+
+def record_dividend_goal_month(month: str, income: float, goal: float, path: str = DATA_FILE) -> bool:
+    """Upsert one monthly income-vs-goal point (one entry per month, latest wins); keeps the last 24 months."""
+    data = load_user_data(path)
+    history = [e for e in (data.get("dividend_goal_history") or []) if e.get("month") != month]
+    history.append({"month": month, "income": max(0.0, float(income or 0.0)), "goal": max(0.0, float(goal or 0.0))})
+    history.sort(key=lambda e: e.get("month", ""))
+    data["dividend_goal_history"] = history[-24:]
     return save_user_data(data, path)
 
 

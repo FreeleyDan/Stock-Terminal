@@ -107,7 +107,9 @@ def main():
     from datetime import date as _date, datetime as _datetime
     src = open("app.py").read()
     tree = ast.parse(src)
-    wanted = {"_parse_purchase_date", "_audit_table_rows", "_splits_after_purchase"}
+    wanted = {"_parse_purchase_date", "_audit_table_rows", "_splits_after_purchase",
+              "_project_drip_income", "_projected_income_at_year", "_years_to_goal",
+              "_dividend_payment_cut", "_payout_jump_check"}
     ns: Dict[str, Any] = {
         "median_yoy_growth": median_yoy_growth,
         "List": List, "Dict": Dict, "Optional": Optional, "Any": Any,
@@ -123,6 +125,30 @@ def main():
     m = _M()
     m._splits_after_purchase = ns["_splits_after_purchase"]
     m._audit_table_rows = ns["_audit_table_rows"]
+    m._years_to_goal = ns["_years_to_goal"]
+    m._dividend_payment_cut = ns["_dividend_payment_cut"]
+    m._payout_jump_check = ns["_payout_jump_check"]
+    # Years to goal: $1,000 growing at 10% reaches $2,000 in 8 years
+    # (1.1^7 = 1.95x, 1.1^8 = 2.14x); DRIP gets there sooner; flat stays put.
+    _grow = [{"income": 1000.0, "dps": 2.0, "dgr": 0.10, "price": 50.0, "shares": 500.0, "drip": False}]
+    assert m._years_to_goal(_grow, 2000.0, 1000.0) == (8, 0.10), m._years_to_goal(_grow, 2000.0, 1000.0)
+    _drip = [dict(_grow[0], drip=True)]
+    _yrs_drip, _ = m._years_to_goal(_drip, 2000.0, 1000.0)
+    assert 1 <= _yrs_drip < 8, _yrs_drip
+    _flat = [{"income": 1000.0, "dps": 2.0, "dgr": None, "price": 50.0, "shares": 500.0, "drip": False}]
+    assert m._years_to_goal(_flat, 2000.0, 1000.0) == (None, None), "no growth rate -> no projection"
+    assert m._years_to_goal(_grow, 900.0, 1000.0) == (0, None), "already at goal"
+    # Payment cut: last payment vs the one before it, not vs the last check.
+    _cut = m._dividend_payment_cut([("2026-06-15", 2.00), ("2026-09-15", 1.80)])
+    assert _cut and "1.80" in _cut and "2.00" in _cut, _cut
+    assert m._dividend_payment_cut([("2026-06-15", 2.00), ("2026-09-15", 2.00)]) is None, "flat is not a cut"
+    assert m._dividend_payment_cut([("2026-09-15", 2.00)]) is None, "one payment is not enough"
+    assert m._dividend_payment_cut([]) is None, "no payments -> no flag"
+    # Payout jump: +10 points, or crossing above 100%.
+    assert m._payout_jump_check(0.65, 0.50) is not None, "50% -> 65% is a jump"
+    assert m._payout_jump_check(0.55, 0.50) is None, "small move is not a jump"
+    assert m._payout_jump_check(1.05, 0.95) is not None, "crossing 100% flags"
+    assert m._payout_jump_check(1.05, 1.02) is None, "already above 100% does not re-flag"
     # Splits after a purchase date are listed; earlier splits are not.
     splits = [("2020-08-31", 4.0), ("2026-01-15", 2.0)]
     after = m._splits_after_purchase(splits, "2019-06-01")

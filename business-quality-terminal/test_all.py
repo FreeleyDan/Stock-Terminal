@@ -333,6 +333,19 @@ d = storage.load_user_data(p)
 check("dividend goal round-trips", d.get("dividend_income_goal"), 12000.0)
 check("negative dividend goal clamps to 0", storage.save_dividend_goal(-5.0, path=p) and storage.load_user_data(p).get("dividend_income_goal"), 0.0)
 check("missing file -> dividend goal defaults to 0", storage.load_user_data(os.path.join(TMP, "nope.json")).get("dividend_income_goal"), 0.0)
+check("save dividend watch", storage.save_dividend_watch({"KO": {"payout": 0.65, "date": "2026-11-05"}}, path=p))
+d = storage.load_user_data(p)
+check("dividend watch round-trips", d.get("dividend_watch"), {"KO": {"payout": 0.65, "date": "2026-11-05"}})
+check("record goal month", storage.record_dividend_goal_month("2026-11", 5000.0, 12000.0, path=p))
+check("record same month twice keeps one entry, latest wins",
+      storage.record_dividend_goal_month("2026-11", 5200.0, 12000.0, path=p) and storage.load_user_data(p).get("dividend_goal_history"),
+      [{"month": "2026-11", "income": 5200.0, "goal": 12000.0}])
+_months = [f"2024-{m:02d}" for m in range(1, 13)] + [f"2025-{m:02d}" for m in range(1, 13)] + ["2026-01"]
+for _m in _months:
+    storage.record_dividend_goal_month(_m, 100.0, 12000.0, path=p)
+d = storage.load_user_data(p)
+check("goal history keeps only the last 24 months", len(d.get("dividend_goal_history")), 24)
+check("goal history drops the oldest months", d["dividend_goal_history"][0]["month"], "2024-03")
 
 # --------------------------------------------------------------------------
 section("Scanner")

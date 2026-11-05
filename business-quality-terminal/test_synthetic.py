@@ -12,13 +12,15 @@ build_mock_companyfacts() helper.
 
 import json
 
+import pandas as pd
+
 from calculations import (
     calculate_cagr,
     calculate_margin_of_safety,
     calculate_owner_earnings,
     calculate_sticker_price,
 )
-from data_fetcher import _build_financial_history
+from data_fetcher import _build_financial_history, _dividends_from_history
 from gatekeeper import evaluate_business_quality
 
 
@@ -160,6 +162,19 @@ def main():
     eps_1yr = gatekeeper_result["big_five"]["EPS"][1]
     if eps_1yr["status"] != "pass":
         errors.append(f"FAIL: EPS 1yr growth check: {eps_1yr}")
+
+    # Dividend payments are extracted from the same yfinance history frame
+    # (actions=True) that carries splits — no extra fetch. Zeros and NaN are
+    # not payments; only the last 12 are kept.
+    hist = pd.DataFrame(
+        {"Dividends": [0.0, 0.25, float("nan"), 0.26, 0.26, 0.27]},
+        index=pd.to_datetime(["2025-03-14", "2025-06-13", "2025-09-12", "2025-12-12", "2026-03-13", "2026-06-12"]),
+    )
+    got_divs = _dividends_from_history(hist)
+    if got_divs != [("2025-06-13", 0.25), ("2025-12-12", 0.26), ("2026-03-13", 0.26), ("2026-06-12", 0.27)]:
+        errors.append(f"FAIL: dividends extraction got {got_divs}")
+    if _dividends_from_history(pd.DataFrame({"Close": [1.0]})) != []:
+        errors.append("FAIL: no Dividends column -> empty list")
 
     print(f"Moat Score: {gatekeeper_result['moat_score']} / 100")
     if errors:

@@ -249,6 +249,7 @@ def _evaluate(ticker: str, prune_unvaluable: bool) -> Tuple[Dict[str, Any], Opti
         "maintenance_capex_est": (hist.get("_maintenance_capex_history") or {}).get(0),
         "audit_series": hist.get("_audit_series") or {},
         "splits": bundle["splits"],
+        "dividend_payments": bundle.get("dividends") or [],
         # ROIC dropouts and SEC tags used — missing from older cached
         # snapshots, so callers must use .get() with a fallback.
         "roic_dropped": hist.get("_roic_dropped") or {},

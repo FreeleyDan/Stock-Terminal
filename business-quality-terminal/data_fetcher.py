@@ -654,6 +654,23 @@ def get_financial_history(ticker: str) -> Optional[Dict[str, Any]]:
 PRICE_HISTORY_YEARS = 16  # enough to cover splits since a 10-year-old filing
 
 
+def _dividends_from_history(hist: Any) -> List[Tuple[str, float]]:
+    """Dividend payments (date, $/share) from a yfinance history frame,
+    most recent last; keeps the last 12. The frame already carries the
+    Dividends column when actions=True, so this costs no extra fetch."""
+    out: List[Tuple[str, float]] = []
+    try:
+        if "Dividends" not in hist.columns:
+            return out
+        for idx, v in zip(hist.index, hist["Dividends"]):
+            v = float(v)
+            if v == v and v > 0:
+                out.append((idx.strftime("%Y-%m-%d"), v))
+    except Exception:
+        return out
+    return out[-12:]
+
+
 def get_price_history(ticker: str) -> Tuple[Optional[Dict[str, Any]], str]:
     """
     One yfinance call -> daily (split-adjusted, NOT dividend-adjusted)
@@ -684,9 +701,11 @@ def get_price_history(ticker: str) -> Tuple[Optional[Dict[str, Any]], str]:
                 v = float(v)
                 if v == v and v > 0 and v != 1.0:
                     splits.append((idx.strftime("%Y-%m-%d"), v))
+        dividends = _dividends_from_history(hist)
         last_date = max(closes)
         return (
-            {"closes": closes, "splits": splits, "last_close": closes[last_date], "last_date": last_date},
+            {"closes": closes, "splits": splits, "dividends": dividends,
+             "last_close": closes[last_date], "last_date": last_date},
             "ok",
         )
     except Exception:

@@ -102,6 +102,24 @@ except ImportError:  # deployed storage.py can lag the repo behind app.py
         _data["dividend_income_goal"] = max(0.0, float(goal or 0.0))
         return save_user_data(_data)
 
+try:
+    from storage import record_dividend_goal_month, save_dividend_watch
+except ImportError:  # deployed storage.py can lag the repo behind app.py
+    def save_dividend_watch(watch: Dict[str, Any]) -> bool:
+        """Local copy of storage.save_dividend_watch (see above)."""
+        _data = load_user_data()
+        _data["dividend_watch"] = watch or {}
+        return save_user_data(_data)
+
+    def record_dividend_goal_month(month: str, income: float, goal: float) -> bool:
+        """Local copy of storage.record_dividend_goal_month (see above)."""
+        _data = load_user_data()
+        _history = [e for e in (_data.get("dividend_goal_history") or []) if e.get("month") != month]
+        _history.append({"month": month, "income": max(0.0, float(income or 0.0)), "goal": max(0.0, float(goal or 0.0))})
+        _history.sort(key=lambda e: e.get("month", ""))
+        _data["dividend_goal_history"] = _history[-24:]
+        return save_user_data(_data)
+
 st.set_page_config(page_title="Business Quality Terminal", layout="wide")
 
 # Restrained styling: no animation, color only for valuation / signal state.
@@ -600,6 +618,69 @@ def _project_drip_income(div_income: float, dps: float, dgr: float, price: float
         if price and price > 0:
             shares_sim += income / price
     return income
+
+
+def _projected_income_at_year(items: List[Dict[str, Any]], years: int) -> float:
+    """Total dividend income in `years` years: holdings with a usable
+    dividend growth rate compound at it (DRIP holdings also grow shares
+    via reinvestment at today's price, flat-price assumption); holdings
+    without one stay flat. Illustration only, not a forecast."""
+    total = 0.0
+    for it in items:
+        dgr = it.get("dgr")
+        if dgr is not None and dgr >= 0:
+            if it.get("drip") and it.get("price") and it.get("shares") and it.get("dps"):
+                total += _project_drip_income(it["income"], it["dps"], dgr, it["price"], it["shares"], years)
+            else:
+                total += it["income"] * ((1.0 + dgr) ** years)
+        else:
+            total += it["income"]
+    return total
+
+
+def _years_to_goal(items: List[Dict[str, Any]], goal: float, current_income: float) -> Any:
+    """Rough years until projected dividend income reaches `goal`.
+    Returns (years, weighted_dgr): years is 0 when already at goal, None
+    when not reached within 50 years; weighted_dgr is the income-weighted
+    average dividend growth rate used, or None when no holding has one."""
+    if current_income >= goal:
+        return (0, None)
+    _w = [(it["income"], it["dgr"]) for it in items
+          if it.get("dgr") is not None and it["dgr"] >= 0 and it.get("income")]
+    _rate = (sum(i * g for i, g in _w) / sum(i for i, _ in _w)) if _w else None
+    for _y in range(1, 51):
+        if _projected_income_at_year(items, _y) >= goal:
+            return (_y, _rate)
+    return (None, _rate)
+
+
+def _dividend_payment_cut(payments: Any) -> Optional[str]:
+    """Flag a cut from the actual payment history: the latest dividend
+    payment vs the one before it. Returns the flag string, or None.
+    A one-off special dividend can make the next regular payment look
+    like a cut — the UI says so where this flag is shown."""
+    if not payments or len(payments) < 2:
+        return None
+    (prev_date, prev_amt), (last_date, last_amt) = payments[-2], payments[-1]
+    if prev_amt and prev_amt > 0 and last_amt < prev_amt * 0.995:
+        _drop = (prev_amt - last_amt) / prev_amt
+        return (
+            f"Dividend cut: last payment ${last_amt:.2f} on {last_date} "
+            f"vs ${prev_amt:.2f} on {prev_date} (\u2212{_drop:.0%})"
+        )
+    return None
+
+
+def _payout_jump_check(payout: Any, prev_payout: Any) -> Optional[str]:
+    """Flag a payout-ratio jump vs the stored baseline: +10 points, or
+    crossing above 100%. Returns the flag string, or None."""
+    if payout is None or prev_payout is None:
+        return None
+    if payout - prev_payout >= 0.10:
+        return f"Payout ratio jumped {prev_payout:.0%} \u2192 {payout:.0%}"
+    if payout > 1.0 and prev_payout <= 1.0:
+        return "Payout above 100% \u2014 dividend may not be covered by earnings"
+    return None
 
 
 def _table_downloads(df: pd.DataFrame, key_prefix: str, filename_base: str) -> None:
@@ -1160,6 +1241,11 @@ with tab_dashboard:
     _dash_watchlists = _dash_data.get("watchlists") or {}
     _dash_cash = _dash_data.get("portfolio_cash") or {}
     _dash_div = 0.0
+    _dash_div_items: List[Dict[str, Any]] = []
+    _dash_checked = 0
+    _dash_watch: Dict[str, Any] = dict(_dash_data.get("dividend_watch") or {})
+    _dash_watch_changed = False
+    _dash_has_cut = False
     if not any(_dash_portfolios.values()) and not any(_dash_watchlists.values()):
         st.info("Nothing to summarize yet — add a holding on the Portfolio tab or a ticker on the Watchlist tab.")
     else:
@@ -1209,6 +1295,36 @@ with tab_dashboard:
                     _div_dash = _h["shares"] * _dps_dash if (_h.get("shares") and _dps_dash) else None
                     if _div_dash is not None:
                         _pf_div += _div_dash
+                    _dash_checked += 1
+                    # Years-to-goal inputs: this holding's income, DPS, 5-yr
+                    # dividend growth, price, shares, DRIP flag.
+                    _dgr_dash = _manual_dash.get("dividend_growth_5yr") if "dividend_growth_5yr" in _manual_dash else _snap.get("dividend_growth_5yr")
+                    if _div_dash is not None:
+                        _dash_div_items.append({"income": _div_dash, "dps": _dps_dash, "dgr": _dgr_dash, "price": _price, "shares": _h.get("shares"), "drip": bool(_h.get("drip"))})
+                    # Dividend-cut watch: the cut flag compares the last two
+                    # actual payments in the snapshot (not the last check).
+                    # The payout jump compares against the stored baseline;
+                    # the snapshot's own payout is used, not a manual
+                    # override — a user editing manual data is not a
+                    # company action.
+                    _cut_flag = _dividend_payment_cut(_snap.get("dividend_payments"))
+                    _payout_raw = _snap.get("payout_ratio")
+                    _prev_pay = (_dash_watch.get(_h["ticker"]) or {}).get("payout")
+                    _pay_flag = _payout_jump_check(_payout_raw, _prev_pay)
+                    _watch_flags = [f for f in (_cut_flag, _pay_flag) if f]
+                    if _watch_flags:
+                        if _cut_flag:
+                            _dash_has_cut = True
+                        _attention.append({
+                            "Where": _pf_name, "Ticker": _h["ticker"],
+                            "Signal": "DIV CUT" if _cut_flag else "PAYOUT",
+                            "Why": _short_why("; ".join(_watch_flags)),
+                        })
+                    _new_watch = {"payout": _payout_raw, "date": datetime.now().strftime("%Y-%m-%d")}
+                    _prev_watch = _dash_watch.get(_h["ticker"])
+                    if _prev_watch is None or _prev_watch.get("payout") != _new_watch["payout"]:
+                        _dash_watch[_h["ticker"]] = _new_watch
+                        _dash_watch_changed = True
                     if _sig["signal"] in ("SELL", "REVIEW"):
                         _attention.append({
                             "Where": _pf_name, "Ticker": _h["ticker"], "Signal": _sig["signal"],
@@ -1241,6 +1357,8 @@ with tab_dashboard:
                             "Where": f"Watchlist '{_wl_name}'", "Ticker": _t, "Signal": _sig["signal"],
                             "Why": _short_why("; ".join(_sig["reasons"])),
                         })
+        if _dash_watch_changed:
+            save_dividend_watch(_dash_watch)
         _m1, _m2, _m3, _m4 = st.columns(4)
         with _m1:
             st.metric("Total account value", money(_dash_value + _dash_cash_total))
@@ -1263,6 +1381,8 @@ with tab_dashboard:
             st.dataframe(pd.DataFrame(_attention), hide_index=True, use_container_width=True)
         else:
             st.success("Nothing needs attention right now — no SELL or REVIEW holdings, and no watchlist ticker at its buy price.")
+        if _dash_has_cut:
+            st.caption("Dividend-cut flags compare the last two actual payments — a one-off special dividend can make the next regular payment look like a cut.")
         _as_of_dash = _prices_as_of_caption(_dash_price_dates)
         if _as_of_dash:
             st.caption(_as_of_dash)
@@ -1298,6 +1418,32 @@ with tab_dashboard:
             )
     else:
         st.caption("Set a goal above and this shows how close your current dividend income is to it.")
+    if _dash_checked > 0 and _div_goal > 0 and _dash_div < _div_goal:
+        _yrs, _rate = _years_to_goal(_dash_div_items, _div_goal, _dash_div)
+        if _yrs is not None:
+            _rate_txt = f" (dividends growing ~{_rate:.1%}/yr)" if _rate is not None else ""
+            st.write(f"Roughly **{_yrs} year{'s' if _yrs != 1 else ''}** to reach the goal at the current pace{_rate_txt}.")
+            st.caption("Estimate only: assumes dividend growth continues, no new money in or out, and flat prices for DRIP reinvestment.")
+        elif _rate is not None:
+            st.write("50+ years to reach the goal at the current pace — growth is too slow to get there soon.")
+        else:
+            st.write("Not on pace at current growth — no holding has a dividend growth rate to project from, so income stays flat.")
+    if _dash_checked > 0:
+        _hist_month = datetime.now().strftime("%Y-%m")
+        _history = list(_dash_data.get("dividend_goal_history") or [])
+        _history = [e for e in _history if e.get("month") != _hist_month]
+        _history.append({"month": _hist_month, "income": _dash_div, "goal": _div_goal})
+        _history.sort(key=lambda e: e.get("month", ""))
+        _history = _history[-24:]
+        record_dividend_goal_month(_hist_month, _dash_div, _div_goal)
+        if len(_history) >= 2:
+            _hist_df = pd.DataFrame(_history).set_index("month")
+            _hist_cols = ["income"] + (["goal"] if any(e.get("goal") for e in _history) else [])
+            st.subheader("Goal history")
+            st.line_chart(_hist_df[_hist_cols].rename(columns={"income": "Income", "goal": "Goal"}))
+            st.caption("One point per month, updated each time you open the Dashboard.")
+        else:
+            st.caption("Goal history starts this month — check back next month for a trend.")
 
 
 # --- 1. Ticker Lookup ----------------------------------------------------
@@ -1538,6 +1684,7 @@ with tab_portfolio:
                                  "Value": "\u2014", "Gain/Loss": "\u2014", "Gain %": "\u2014", "Sticker": "\u2014", "Moat": "\u2014",
                                  "Meaning": "\u2014", "Moat type": "\u2014", "Weight": "\u2014", "Target %": "\u2014", "Drift": "\u2014",
                                  "Div Income/yr": "\u2014",
+                                 "% of Div Income": "\u2014",
                                  "Yield on Cost": "\u2014", "Flags": "\u2014", "Mkt Cap": "\u2014", "PEG": "\u2014",
                                  "Owner Yield": "\u2014", "Data": "\u2014", "Tax Term": "\u2014", "Days to LT": "\u2014", "Est Tax": "\u2014",
                                  "Signal": "NO DATA", "Lean": "\u2014", "Why": _short_why(snap["error"]), "_rank": 9, "_value": 0.0, "_moat": 0.0})
@@ -1659,6 +1806,7 @@ with tab_portfolio:
                     "Meaning": note_pf.get("meaning") or "\u2014", "Moat type": note_pf.get("moat_type") or "\u2014",
                     "Weight": "\u2014", "Target %": "\u2014" if h.get("target_pct") is None else f"{h['target_pct']:.1f}%", "Drift": "\u2014",
                     "Div Income/yr": money(div_income) + dps_label if div_income is not None else "\u2014",
+                    "% of Div Income": "\u2014",
                     "Yield on Cost": "\u2014" if yoc is None else f"{yoc:.1%}",
                     "Flags": "; ".join(det) if det else "\u2014",
                     "Mkt Cap": _format_market_cap(_market_cap(snap)),
@@ -1673,6 +1821,7 @@ with tab_portfolio:
                     "_value": value or 0.0, "_moat": snap["moat_score"] or 0.0, "_target": h.get("target_pct"),
                     "_ticker_for_log": h["ticker"], "_price_for_log": price, "_sticker_for_log": val["sticker_price"],
                     "_gain": gain, "_term": tax_info_pf["term"], "_shares": h["shares"], "_avg_cost": h["avg_cost"],
+                    "_div_income": div_income or 0.0,
                 })
         # Weights are % of total account value (holdings + cash), so a
         # cash balance makes weights real instead of holdings-only.
@@ -1682,6 +1831,9 @@ with tab_portfolio:
                 r["Weight"] = f"{r['_value'] / total_account:.1%}"
                 if r.get("_target") is not None:
                     r["Drift"] = f"{(r['_value'] / total_account * 100.0 - r['_target']):+.1f}%"
+        for r in rows:
+            if total_div_income > 0 and r.get("_div_income"):
+                r["% of Div Income"] = f"{r['_div_income'] / total_div_income:.1%}"
         weighted_moat = (sum(r["_value"] * r["_moat"] for r in rows) / total_value) if total_value > 0 else None
         largest = max(rows, key=lambda r: r["_value"]) if rows else None
         rows.sort(key=lambda r: r["_rank"])
@@ -1703,7 +1855,7 @@ with tab_portfolio:
             st.dataframe(pd.DataFrame(review_items).drop(columns=["_urgency"]), hide_index=True, use_container_width=True)
         else:
             st.caption("Review queue: no holdings need attention right now.")
-        df = pd.DataFrame(rows).drop(columns=["_rank", "_value", "_moat", "_target", "_ticker_for_log", "_price_for_log", "_sticker_for_log", "_gain", "_term", "_shares", "_avg_cost"])
+        df = pd.DataFrame(rows).drop(columns=["_rank", "_value", "_moat", "_target", "_ticker_for_log", "_price_for_log", "_sticker_for_log", "_gain", "_term", "_shares", "_avg_cost", "_div_income"])
         st.dataframe(style_signal_column(df), hide_index=True, use_container_width=True)
         as_of_pf = _prices_as_of_caption(portfolio_price_dates)
         if as_of_pf:
