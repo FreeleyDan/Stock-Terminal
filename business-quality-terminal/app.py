@@ -900,9 +900,19 @@ with tab_portfolio:
     # vs taxable). Legacy single-portfolio files migrate to "Main".
     saved_all = load_user_data()
     portfolio_names = list((saved_all.get("portfolios") or {"Main": []}).keys()) or ["Main"]
+    # BUG FIX (2026-11-04): pf_selected_name used to be the selectbox's own
+    # widget key, and the Add/Delete/Import handlers below set it AFTER the
+    # selectbox had already rendered in the same run. Streamlit forbids
+    # changing a widget's session-state value after instantiation, so the
+    # first click errored — even though the save before it had already
+    # succeeded, which is why a second tap then "worked" (the name was
+    # already in the list). Fix: pf_selected_name is now plain state, not
+    # a widget key; the selectbox is driven by index, and the user's
+    # dropdown pick is written back to the plain key afterwards.
     if "pf_selected_name" not in st.session_state or st.session_state["pf_selected_name"] not in portfolio_names:
         st.session_state["pf_selected_name"] = portfolio_names[0]
-    pf_name = st.selectbox("Portfolio", portfolio_names, key="pf_selected_name")
+    pf_name = st.selectbox("Portfolio", portfolio_names, index=portfolio_names.index(st.session_state["pf_selected_name"]))
+    st.session_state["pf_selected_name"] = pf_name
     new_pf_col1, new_pf_col2, new_pf_col3 = st.columns(3)
     with new_pf_col1:
         new_pf_name = st.text_input("New portfolio name", key="pf_new_name").strip()
@@ -1443,9 +1453,13 @@ with tab_watchlist:
     # Named watchlists, same pattern as named portfolios.
     saved_wl_all = load_user_data()
     watchlist_names = list((saved_wl_all.get("watchlists") or {"Main": []}).keys()) or ["Main"]
+    # Same bug fix as portfolios above: wl_selected_name is plain state,
+    # not the selectbox's widget key, so Add/Delete can set it and rerun
+    # without Streamlit's post-instantiation widget-state error.
     if "wl_selected_name" not in st.session_state or st.session_state["wl_selected_name"] not in watchlist_names:
         st.session_state["wl_selected_name"] = watchlist_names[0]
-    wl_name = st.selectbox("Watchlist", watchlist_names, key="wl_selected_name")
+    wl_name = st.selectbox("Watchlist", watchlist_names, index=watchlist_names.index(st.session_state["wl_selected_name"]))
+    st.session_state["wl_selected_name"] = wl_name
     wl_c1, wl_c2, wl_c3 = st.columns(3)
     with wl_c1:
         new_wl_name = st.text_input("New watchlist name", key="wl_new_name").strip()
