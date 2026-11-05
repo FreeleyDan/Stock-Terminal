@@ -15,9 +15,10 @@ Limits, stated in the UI wherever these numbers are shown:
   instead of guessed. A "not found" means "not found by name in the
   latest 13F", not a proof the manager owns nothing in the company.
 - Phil Town is NOT a 13F filer — he manages the Rule One Fund (RULRX),
-  a mutual fund that files N-PORT. That check lives in
-  fetch_latest_nport / check_nport below, with its own filing dates
-  and lag warning, and is never mixed into the 13F table.
+  a mutual fund that files N-PORT. That row is produced by
+  fetch_latest_nport / check_nport below and is included in the SAME
+  table as the 13F managers (same check_holdings call, same button),
+  marked with source "N-PORT" so the filing type is never hidden.
 - Nomad Investment Partnership (wound down in 2014) has no current
   filing and is listed in NON_13F, never as a holding.
 """
@@ -49,18 +50,24 @@ MANAGERS: List[Dict[str, Any]] = [
     {"person": "Li Lu", "manager": "Himalaya Capital Management LLC", "cik": 1709323},
     {"person": "Mohnish Pabrai", "manager": "Dalal Street, LLC", "cik": 1549575},
     {"person": "Guy Spier", "manager": "Aquamarine Zurich AG", "cik": 1953324},
+    # Added 2026-11-04 at the user's request. CIKs verified against SEC
+    # submissions (data.sec.gov/submissions/CIK....json) the same day:
+    # each name below matches the filer and each has a 13F-HR for report
+    # 2026-06-30. Note the accession prefix can differ from the CIK
+    # (e.g. Weitz 0001821268-26-000133, Southeastern 0001398344-26-014641)
+    # — the filing directory still uses the CIK, and fetch_latest_13f
+    # reads the accession from submissions, so it fetches correctly.
+    {"person": "Bill Nygren", "manager": "Harris Associates L.P.", "cik": 813917},
+    {"person": "Christopher Davis", "manager": "Davis Selected Advisers", "cik": 1036325},
+    {"person": "Francois Rochon", "manager": "Giverny Capital Inc.", "cik": 1641864},
+    {"person": "Wallace Weitz", "manager": "Weitz Investment Management, Inc.", "cik": 883965},
+    {"person": "Mason Hawkins", "manager": "Southeastern Asset Management Inc.", "cik": 807985},
 ]
 
 NON_13F: List[Dict[str, str]] = [
-    # Correction 2026-11-04, after the user pointed to Valuesider:
-    # Phil Town IS a portfolio manager — of the Rule One Fund (RULRX),
-    # via Rule One Partners LLC, since 2019 (SEC prospectus, World Funds
-    # Trust, CIK 1396092). That fund files N-PORT (mutual-fund holdings),
-    # not 13F-HR, so it is a separate source type, not a 13F row.
-    # Valuesider Q2 2026: $188.5M, 40 holdings, filed 25 Aug 2026;
-    # top stock holdings NFLX, CNSWF, SFM, CRM (plus GOIXX, a
-    # government money-market fund, at 33.35% — cash-like, not a pick).
-    {"person": "Phil Town", "note": "Not a 13F filer — portfolio manager of the Rule One Fund (RULRX) since 2019, which files N-PORT holdings instead. See the N-PORT eye-check below the 13F table."},
+    # Phil Town used to live here — he now has a row in the main table
+    # (source "N-PORT", Rule One Fund, World Funds Trust CIK 1396092,
+    # series S000065131; manager since 2019). Only Nomad remains here.
     {"person": "Nomad Investment Partnership", "note": "Closed — wound down in 2014 and capital returned, so there is no current 13F to check."},
 ]
 
@@ -221,15 +228,19 @@ def fetch_latest_13f(cik: int) -> Dict[str, Any]:
 def check_holdings(ticker: str, company_name: Optional[str]) -> List[Dict[str, Any]]:
     """One row per manager: holds? (by issuer name), matches, or error.
 
-    Never returns a bare 'not held' for a manager whose filing could not
-    be fetched — that row carries an error instead.
+    This is the single entry point the UI calls — one button, one table.
+    It covers the 13F managers in MANAGERS plus Phil Town's Rule One
+    Fund, whose row comes from check_nport and is marked source "N-PORT"
+    (a mutual-fund filing, not a 13F) instead of living in a separate
+    expander. Never returns a bare 'not held' for a manager whose filing
+    could not be fetched — that row carries an error instead.
     """
     target = normalize_issuer_name(company_name or ticker)
     rows: List[Dict[str, Any]] = []
     for mgr in MANAGERS:
         data = fetch_latest_13f(int(mgr["cik"]))
         row: Dict[str, Any] = {
-            "person": mgr["person"], "manager": mgr["manager"],
+            "person": mgr["person"], "manager": mgr["manager"], "source": "13F",
             "report_date": data.get("report_date"), "filing_date": data.get("filing_date"),
             "holds": False, "matches": [], "ambiguous": False, "error": data.get("error"),
         }
@@ -259,6 +270,11 @@ def check_holdings(ticker: str, company_name: Optional[str]) -> List[Dict[str, A
         # do not guess which class the ticker is.
         row["ambiguous"] = len({m["cusip"] for m in matches}) > 1
         rows.append(row)
+    # Phil Town in the same table: same shape as a 13F row, source
+    # "N-PORT" so the UI can label the filing type.
+    nport_row = check_nport(ticker, company_name)
+    nport_row["source"] = "N-PORT"
+    rows.append(nport_row)
     return rows
 
 
@@ -380,6 +396,8 @@ def fetch_latest_nport(cik: int = RULE_ONE_CIK, series_id: str = RULE_ONE_SERIES
 def check_nport(ticker: str, company_name: Optional[str]) -> Dict[str, Any]:
     """Does the Rule One Fund hold this ticker, by issuer name?
 
+    Helper used by check_holdings to build the Phil Town row in the
+    same table as the 13F managers — not a separate UI function.
     Returns the same shape as one 13F row, plus the fund's net assets
     so the UI can show the position as a % of the fund.
     """
