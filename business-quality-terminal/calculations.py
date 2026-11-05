@@ -12,7 +12,9 @@ from here -- they only need to check for None.
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+import statistics
+from datetime import date
+from typing import Dict, List, Optional
 
 
 def calculate_cagr(
@@ -232,4 +234,36 @@ def estimate_growth_rate_from_eps_history(eps_history: Dict[int, float]) -> Opti
                 return cagr
         return None
     except (TypeError, AttributeError):
+        return None
+
+
+def median_yoy_growth(series_by_date: Dict[str, float]) -> Optional[float]:
+    """
+    Median year-over-year growth across consecutive fiscal year-ends.
+
+    A CAGR is end-to-end: one terrible base year (or one great year) can
+    flatter or flatten it, so it can hide what a business typically did.
+    The median YoY shows the typical year's growth instead. Each step is
+    annualized by the actual days between year-ends (they are ~365 days
+    apart, but filings can shift), and only steps where both values are
+    positive count — a change across a loss year or a sign change is not
+    a growth rate. Returns None with fewer than two usable steps.
+    Display only: it never feeds the Sticker, Moat, or a signal.
+    """
+    try:
+        dated: List[tuple] = []
+        for end, val in (series_by_date or {}).items():
+            y, m, d = (int(x) for x in str(end).split("-"))
+            dated.append((date(y, m, d), float(val)))
+        dated.sort()
+        steps: List[float] = []
+        for (d1, v1), (d2, v2) in zip(dated, dated[1:]):
+            days = (d2 - d1).days
+            if days < 200 or days > 550 or v1 <= 0 or v2 <= 0:
+                continue
+            steps.append((v2 / v1) ** (365.25 / days) - 1.0)
+        if len(steps) < 2:
+            return None
+        return statistics.median(steps)
+    except (TypeError, ValueError):
         return None

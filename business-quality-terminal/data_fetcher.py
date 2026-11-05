@@ -111,6 +111,15 @@ TAG_CANDIDATES: Dict[str, List[str]] = {
         "CommonStockDividendsPerShareDeclared",
         "CommonStockDividendsPerShareCashPaid",
     ],
+    # Display-only accuracy metrics (never feed the Sticker, Moat, or a
+    # signal): stock-based compensation, interest expense, operating
+    # income. SBC is the cash-flow add-back tag most filers report.
+    "Share_Based_Compensation": [
+        "ShareBasedCompensation",
+        "ShareBasedCompensationExpense",
+    ],
+    "Interest_Expense": ["InterestExpense", "InterestAndDebtExpense"],
+    "Operating_Income": ["OperatingIncomeLoss"],
 }
 
 METRIC_UNIT: Dict[str, str] = {
@@ -126,6 +135,9 @@ METRIC_UNIT: Dict[str, str] = {
     "Cash": "USD",
     "Shares_Outstanding": "shares",
     "Dividends_Per_Share": "USD/shares",
+    "Share_Based_Compensation": "USD",
+    "Interest_Expense": "USD",
+    "Operating_Income": "USD",
 }
 
 DURATION_METRICS = {
@@ -137,6 +149,9 @@ DURATION_METRICS = {
     "Depreciation_Amortization",
     "Shares_Outstanding",
     "Dividends_Per_Share",
+    "Share_Based_Compensation",
+    "Interest_Expense",
+    "Operating_Income",
 }
 INSTANT_METRICS = {"Stockholders_Equity", "Long_Term_Debt", "Short_Term_Debt", "Cash"}
 
@@ -527,6 +542,52 @@ def _build_financial_history(
 
     equity_per_share = _combine_horizon_dicts(equity, shares, lambda a, b: a / b if b else None)
 
+    # Display-only accuracy metrics (never feed the Sticker, Moat, or a
+    # signal). SBC-adjusted FCF subtracts stock-based compensation from
+    # free cash flow — SBC is a real cost to owners (dilution), even
+    # though it never leaves as cash. Interest coverage is operating
+    # income / interest expense. Maintenance capex is estimated as D&A
+    # (a rough proxy, not a reported number — the app labels it as such).
+    sbc = by_horizon["Share_Based_Compensation"]
+    interest = by_horizon["Interest_Expense"]
+    op_income = by_horizon["Operating_Income"]
+    sbc_adjusted_fcf = _combine_horizon_dicts(free_cash_flow, sbc, lambda a, b: a - b)
+    interest_coverage = _combine_horizon_dicts(
+        op_income, interest, lambda a, b: a / b if b and b > 0 else None
+    )
+
+    # Audit series: full {fiscal_year_end: value} series (split-adjusted)
+    # for the 10-year audit table — the horizon dicts above only keep
+    # 0/1/3/5/10 years ago. ROIC needs invested capital per date.
+    def _combine_date_series(a: Dict[str, float], b: Dict[str, float], op) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for end, a_val in (a or {}).items():
+            b_val = (b or {}).get(end)
+            if b_val is None:
+                continue
+            try:
+                val = op(a_val, b_val)
+            except Exception:
+                continue
+            if val is not None:
+                out[end] = val
+        return out
+
+    _ic_by_date: Dict[str, float] = {}
+    for end, eq in (raw_series.get("Stockholders_Equity") or {}).items():
+        lt = (raw_series.get("Long_Term_Debt") or {}).get(end, 0.0)
+        st = (raw_series.get("Short_Term_Debt") or {}).get(end, 0.0)
+        cs = (raw_series.get("Cash") or {}).get(end, 0.0)
+        try:
+            _ic_by_date[end] = float(eq) + float(lt) + float(st) - float(cs)
+        except (TypeError, ValueError):
+            continue
+    _roic_by_date = {
+        end: ni / _ic_by_date[end]
+        for end, ni in (raw_series.get("Net_Income") or {}).items()
+        if end in _ic_by_date and _ic_by_date[end] > 0
+    }
+
     return {
         "ROIC": roic,
         "Equity_Per_Share": equity_per_share,
@@ -537,6 +598,28 @@ def _build_financial_history(
         "Owner_Earnings": {0: owner_earnings[0]} if 0 in owner_earnings else {},
         "Cap_Ex": {0: cap_ex[0]} if 0 in cap_ex else {},
         "Net_Income": {0: net_income[0]} if 0 in net_income else {},
+        "Share_Based_Compensation": {0: sbc[0]} if 0 in sbc else {},
+        "Interest_Expense": {0: interest[0]} if 0 in interest else {},
+        "Operating_Income": {0: op_income[0]} if 0 in op_income else {},
+        "SBC_Adjusted_FCF": {0: sbc_adjusted_fcf[0]} if 0 in sbc_adjusted_fcf else {},
+        "Total_Debt": {0: total_debt[0]} if 0 in total_debt else {},
+        "_sbc_adjusted_fcf_history": sbc_adjusted_fcf,
+        "_interest_coverage_history": interest_coverage,
+        "_total_debt_history": total_debt,
+        "_maintenance_capex_history": dep_amort,
+        "_audit_series": {
+            "ROIC": _roic_by_date,
+            "Equity_Per_Share": _combine_date_series(
+                raw_series.get("Stockholders_Equity"), raw_series.get("Shares_Outstanding"),
+                lambda a, b: a / b if b else None,
+            ),
+            "EPS": raw_series.get("EPS", {}),
+            "Sales": raw_series.get("Sales", {}),
+            "Free_Cash_Flow": _combine_date_series(
+                raw_series.get("Operating_Cash_Flow"), raw_series.get("Cap_Ex"),
+                lambda a, b: a - b,
+            ),
+        },
         "_owner_earnings_history": owner_earnings,
         "_cap_ex_history": cap_ex,
         "_net_income_history": net_income,

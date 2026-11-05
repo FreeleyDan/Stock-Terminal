@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
-from calculations import calculate_ddm_value, calculate_sticker_price
+from calculations import calculate_ddm_value, calculate_sticker_price, median_yoy_growth
 from data_fetcher import _build_financial_history, clear_cache, fetch_raw_companyfacts, get_price_history, normalize_ticker
 from holdings import NON_13F, check_holdings
 from gatekeeper import BIG_FIVE_METRICS, HORIZONS
@@ -478,6 +478,64 @@ def _crosscheck_normalized(snap: Dict[str, Any], val: Optional[Dict[str, Any]], 
         return {"error": "Cross-check couldn't be computed from SEC data"}
 
 
+def _audit_table_rows(audit_series: Dict[str, Any], gatekeeper: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the 10-year audit table from the snapshot's audit series.
+    Returns {"years": [2015, ..., 2025], "rows": [{metric, values,
+    median_yoy, cagr10, is_pct}]}. Median YoY is the typical year's
+    growth; the 10-yr CAGR is the gatekeeper's end-to-end figure — when
+    they disagree, a base year is doing the work. Display only.
+    """
+    series = audit_series or {}
+    labels = {
+        "ROIC": "ROIC",
+        "Equity_Per_Share": "Equity / share",
+        "EPS": "EPS",
+        "Sales": "Sales",
+        "Free_Cash_Flow": "Free cash flow",
+    }
+    years: List[int] = sorted({int(str(d)[:4]) for s in series.values() for d in (s or {})})
+    years = years[-11:]
+    rows = []
+    big_five = (gatekeeper or {}).get("big_five") or {}
+    for key, label in labels.items():
+        s = series.get(key) or {}
+        by_year: Dict[int, float] = {}
+        for d, v in s.items():
+            try:
+                by_year[int(str(d)[:4])] = float(v)
+            except (TypeError, ValueError):
+                continue
+        cagr10 = ((big_five.get(key) or {}).get(10) or {}).get("cagr")
+        rows.append({
+            "metric": label,
+            "values": [by_year.get(y) for y in years],
+            "median_yoy": median_yoy_growth(s),
+            "cagr10": cagr10,
+            "is_pct": key == "ROIC",
+        })
+    return {"years": years, "rows": rows}
+
+
+def _splits_after_purchase(splits: Any, purchase_date_str: Optional[str]) -> List[Dict[str, Any]]:
+    """Splits that happened after a purchase date, as [{date, ratio}].
+    A split after the purchase means the shares/cost entered may still
+    be pre-split. Empty when there is no purchase date or no split list
+    (older cached snapshots lack it).
+    """
+    purchased = _parse_purchase_date(purchase_date_str)
+    if purchased is None:
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in splits or []:
+        try:
+            sdate, ratio = item[0], float(item[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if ratio and ratio != 1.0 and str(sdate) > purchased.isoformat():
+            out.append({"date": str(sdate), "ratio": ratio})
+    return out
+
+
 def _short_why(text: str, limit: int = 100) -> str:
     """Table cells must stay short — long Why text runs off the page
     and cannot be scrolled to on some clients. The full reasons live in
@@ -870,6 +928,34 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
         else:
             st.write("EPS vs free-cash-flow comparison: \u2014")
 
+    # 10-year audit — the actual year-by-year Big Five values, so a
+    # CAGR can't hide behind one weird base year. Display only.
+    _audit = _audit_table_rows(snap.get("audit_series") or {}, snap.get("gatekeeper") or {})
+    with st.expander("10-year audit — Big Five values by year (median YoY vs 10-yr CAGR)", expanded=False):
+        if not _audit["years"]:
+            st.caption("Audit data appears after the snapshot refreshes (fundamentals are cached 24 hours).")
+        else:
+            _a_cols = ["Metric"] + [str(y) for y in _audit["years"]] + ["Median YoY", "10-yr CAGR"]
+            _a_rows = []
+            for _ar in _audit["rows"]:
+                _vals = []
+                for _v in _ar["values"]:
+                    if _v is None:
+                        _vals.append("\u2014")
+                    elif _ar["is_pct"]:
+                        _vals.append(f"{_v:.1%}")
+                    elif _ar["metric"] in ("EPS", "Equity / share"):
+                        _vals.append(money(_v))
+                    else:
+                        _vals.append(_format_market_cap(_v))
+                _a_rows.append(
+                    {"Metric": _ar["metric"], **dict(zip([str(y) for y in _audit["years"]], _vals)),
+                     "Median YoY": "\u2014" if _ar["median_yoy"] is None else f"{_ar['median_yoy']:.1%}",
+                     "10-yr CAGR": "\u2014" if _ar["cagr10"] is None else f"{_ar['cagr10']:.1%}"}
+                )
+            st.dataframe(pd.DataFrame(_a_rows, columns=_a_cols), hide_index=True, use_container_width=True)
+            st.caption("CAGR is end-to-end — one bad base year flatters it; median YoY is the typical year's growth. When they disagree, look at the yearly values. Display only — nothing here changes the Sticker, Moat, or any signal.")
+
     # Buffett notes: Meaning / circle of competence, moat type,
     # Management, thesis, and sell trigger. XBRL cannot see these.
     note = _notes_for(ticker)
@@ -909,6 +995,30 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
                     )
                 else:
                     st.write("ROIC level: — (not in SEC history)")
+        st.markdown("**More eye checks — from this snapshot, no extra fetch**")
+        _fcf = snap.get("free_cash_flow")
+        _sbc = snap.get("sbc")
+        _sbc_fcf = snap.get("sbc_adjusted_fcf")
+        if _fcf is not None and _sbc is not None and _sbc_fcf is not None:
+            st.write(f"Free cash flow (latest year): {money(_fcf)} — after stock-based compensation {money(_sbc)}: {money(_sbc_fcf)}")
+        elif _fcf is not None:
+            st.write(f"Free cash flow (latest year): {money(_fcf)} — SBC: \u2014 (not in SEC filings)")
+        else:
+            st.write("Free cash flow: \u2014")
+        _oe = snap.get("owner_earnings")
+        _ni = snap.get("net_income")
+        _maint = snap.get("maintenance_capex_est")
+        if _oe is not None and _ni is not None and _maint is not None:
+            st.write(f"Owner earnings (latest year, total capex): {money(_oe)} — with maintenance capex \u2248 D&A ({money(_maint)}): {money(_ni)}")
+        elif _oe is not None:
+            st.write(f"Owner earnings (latest year, total capex): {money(_oe)}")
+        st.caption("Maintenance capex is estimated as depreciation & amortization — a rough proxy, not a reported number, so the maintenance-capex owner earnings equal net income by construction. SBC is a real cost to owners (dilution) even though no cash leaves.")
+        _ic = snap.get("interest_coverage")
+        if _ic is not None:
+            st.write(f"Interest coverage (operating income / interest expense): {_ic:.1f}x")
+        else:
+            st.write("Interest coverage: \u2014 (no interest expense in SEC filings, or operating income missing)")
+        st.write(f"Total debt (long-term + short-term, latest year): {money(snap.get('total_debt'))}")
 
     # Value-investor holdings — eye check only, from SEC filings.
     # One expander, one button, one table: the 13F managers plus Phil
@@ -1400,6 +1510,16 @@ with tab_portfolio:
                     review_reasons.extend(det)
                 if comp_pf["metrics"] <= 3:
                     review_reasons.append(f"Thin data: {comp_pf['metrics']}/5 Big Five metrics determined")
+                # Split warning: bought before a split, the shares/cost
+                # entered may still be pre-split (Yahoo splits, from
+                # the snapshot). Post-split shares are x the ratio and
+                # cost per share is / the ratio.
+                for _sp in _splits_after_purchase(snap.get("splits"), h.get("purchase_date")):
+                    review_reasons.append(
+                        f"Split {_sp['ratio']:g}-for-1 on {_sp['date']} after your {h.get('purchase_date')} purchase — "
+                        f"check shares (x{_sp['ratio']:g}) and cost (÷{_sp['ratio']:g}) are post-split"
+                    )
+                    review_urgency = min(review_urgency, 1)
                 # Dividend safety / jeopardy, only for holdings with a
                 # known dividend (non-dividend holdings are not scored).
                 payout_pf = manual_pf.get("payout_ratio") if "payout_ratio" in manual_pf else snap.get("payout_ratio")

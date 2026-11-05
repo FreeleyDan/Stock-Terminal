@@ -235,6 +235,20 @@ def _evaluate(ticker: str, prune_unvaluable: bool) -> Tuple[Dict[str, Any], Opti
         # snapshots — callers must use .get() with a fallback):
         "owner_earnings": (hist.get("_owner_earnings_history") or {}).get(0),
         "shares_history": hist.get("_shares_outstanding_history") or {},
+        # Display-only accuracy numbers (audit table, SBC, interest
+        # coverage, total debt, split list). Missing from older cached
+        # snapshots; callers must use .get() with a fallback.
+        "free_cash_flow": (hist.get("Free_Cash_Flow") or {}).get(0),
+        "net_income": (hist.get("Net_Income") or {}).get(0),
+        "sbc": (hist.get("Share_Based_Compensation") or {}).get(0),
+        "sbc_adjusted_fcf": (hist.get("SBC_Adjusted_FCF") or {}).get(0),
+        "interest_expense": (hist.get("Interest_Expense") or {}).get(0),
+        "operating_income": (hist.get("Operating_Income") or {}).get(0),
+        "interest_coverage": (hist.get("_interest_coverage_history") or {}).get(0),
+        "total_debt": (hist.get("Total_Debt") or {}).get(0),
+        "maintenance_capex_est": (hist.get("_maintenance_capex_history") or {}).get(0),
+        "audit_series": hist.get("_audit_series") or {},
+        "splits": bundle["splits"],
         # ROIC dropouts and SEC tags used — missing from older cached
         # snapshots, so callers must use .get() with a fallback.
         "roic_dropped": hist.get("_roic_dropped") or {},
