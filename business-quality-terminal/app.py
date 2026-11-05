@@ -722,6 +722,19 @@ def _years_to_goal_observed(current_income: float, goal: float, annual_rate: Opt
     return math.ceil(_y) if _y <= 50 else None
 
 
+def _record_goal_month(month: str, income: float, goal: float, buys: float = 0.0, raises: float = 0.0) -> bool:
+    """Record one monthly goal-history point. Tolerates a stale storage.py:
+    the old record_dividend_goal_month takes only (month, income, goal),
+    so it imports fine but rejects the buys/raises keywords with a
+    TypeError. Fall back to the 3-arg call (attribution is dropped on
+    that run, the month's income/goal still records) instead of crashing
+    the app. The next deploy, with the new storage.py, records it all."""
+    try:
+        return record_dividend_goal_month(month, income, goal, buys=buys, raises=raises)
+    except TypeError:
+        return record_dividend_goal_month(month, income, goal)
+
+
 def _dividend_payment_cut(payments: Any) -> Optional[str]:
     """Flag a cut from the actual payment history: the latest dividend
     payment vs the one before it. Returns the flag string, or None.
@@ -1524,7 +1537,7 @@ with tab_dashboard:
         _history.append({"month": _hist_month, "income": _dash_div, "goal": _div_goal, "buys": _month_buys, "raises": _month_raises})
         _history.sort(key=lambda e: e.get("month", ""))
         _history = _history[-24:]
-        record_dividend_goal_month(_hist_month, _dash_div, _div_goal, buys=_month_buys, raises=_month_raises)
+        _record_goal_month(_hist_month, _dash_div, _div_goal, buys=_month_buys, raises=_month_raises)
         if _div_goal > 0 and _dash_div < _div_goal:
             _obs_rate = _observed_income_growth(_history)
             if _obs_rate is not None:

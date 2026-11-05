@@ -110,7 +110,8 @@ def main():
     wanted = {"_parse_purchase_date", "_audit_table_rows", "_splits_after_purchase",
               "_project_drip_income", "_projected_income_at_year", "_years_to_goal",
               "_dividend_payment_cut", "_payout_jump_check",
-              "_income_attribution", "_observed_income_growth", "_years_to_goal_observed"}
+              "_income_attribution", "_observed_income_growth", "_years_to_goal_observed",
+              "_record_goal_month"}
     import statistics as _statistics
     import math as _math
     ns: Dict[str, Any] = {
@@ -135,6 +136,7 @@ def main():
     m._income_attribution = ns["_income_attribution"]
     m._observed_income_growth = ns["_observed_income_growth"]
     m._years_to_goal_observed = ns["_years_to_goal_observed"]
+    m._record_goal_month = ns["_record_goal_month"]
     # Income attribution: buys + raises must sum to the income change.
     _b, _r = m._income_attribution(110.0, 2.0, 100.0, 2.0)
     assert (_b, _r) == (20.0, 0.0), (_b, _r)
@@ -157,6 +159,23 @@ def main():
     assert m._years_to_goal_observed(1000.0, 900.0, 0.10) == 0, "already at goal"
     assert m._years_to_goal_observed(1000.0, 2000.0, None) is None, "no rate -> no projection"
     assert m._years_to_goal_observed(1000.0, 2000.0, 0.0) is None, "zero rate -> no projection"
+    # _record_goal_month must survive a stale storage.py: the old
+    # record_dividend_goal_month takes only (month, income, goal), so it
+    # imports fine but rejects the buys/raises keywords with TypeError.
+    _calls = []
+    def _new_rec(month, income, goal, buys=0.0, raises=0.0):
+        _calls.append((month, income, goal, buys, raises))
+        return True
+    ns["record_dividend_goal_month"] = _new_rec
+    assert m._record_goal_month("2026-11", 5200.0, 12000.0, buys=300.0, raises=50.0) is True
+    assert _calls == [("2026-11", 5200.0, 12000.0, 300.0, 50.0)], _calls
+    def _old_rec(month, income, goal):
+        _calls.append((month, income, goal))
+        return True
+    ns["record_dividend_goal_month"] = _old_rec
+    _calls.clear()
+    assert m._record_goal_month("2026-11", 5200.0, 12000.0, buys=300.0, raises=50.0) is True, "stale storage must fall back, not crash"
+    assert _calls == [("2026-11", 5200.0, 12000.0)], _calls
     # Years to goal: $1,000 growing at 10% reaches $2,000 in 8 years
     # (1.1^7 = 1.95x, 1.1^8 = 2.14x); DRIP gets there sooner; flat stays put.
     _grow = [{"income": 1000.0, "dps": 2.0, "dgr": 0.10, "price": 50.0, "shares": 500.0, "drip": False}]
