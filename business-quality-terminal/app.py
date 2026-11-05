@@ -42,6 +42,7 @@ from storage import (
     delete_portfolio,
     delete_scan_preset,
     delete_watchlist,
+    last_saved_display,
     load_last_scan,
     load_user_data,
     parse_imported_full,
@@ -614,6 +615,21 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
             "Thin data — this Moat Score is based on limited history. Treat it with less confidence "
             "than a score with 5/5 metrics determined."
         )
+    # ROIC dropouts, no longer silent: if ROIC is missing for a horizon,
+    # say why — a capped Moat is not the same as a bad business.
+    roic_dropped = snap.get("roic_dropped") or {}
+    if roic_dropped:
+        def _roic_year_label(y: Any) -> str:
+            try:
+                yi = int(y)
+            except Exception:
+                return str(y)
+            return "latest year" if yi == 0 else f"{yi} yrs ago"
+        st.warning(
+            "ROIC not computed for: "
+            + "; ".join(f"{_roic_year_label(y)} — {reason}" for y, reason in sorted(roic_dropped.items(), key=lambda kv: str(kv[0])))
+            + ". Those horizons contribute no ROIC to the Big Five / Moat, which caps the score — it does not mean ROIC is low."
+        )
     details = [f"Last close {snap.get('price_date', '')}"]
     if val["growth_used"] is not None:
         g = snap["growth_rate"]
@@ -679,6 +695,12 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
         st.write(f"Debt Test: LT debt / owner earnings = {debt_ratio:.2f}x" if debt_ratio is not None else "Debt Test: \u2014 (needs owner earnings)")
         st.write(f"Capital allocation: Cap-Ex / net income = {cap_ratio:.1%}" if cap_ratio is not None else "Capital allocation: \u2014")
         st.write(f"Owner earnings (latest year): {money(snap.get('owner_earnings'))}")
+        tag_used = snap.get("tag_used") or {}
+        if tag_used:
+            st.caption(
+                "SEC tags used (fullest candidate tag per metric, gaps filled from other tags): "
+                + "; ".join(f"{k}: {v}" for k, v in sorted(tag_used.items()))
+            )
         ch10 = _share_change_pct(snap.get("shares_history") or {}, 10)
         ch5 = _share_change_pct(snap.get("shares_history") or {}, 5)
         if ch10 is not None:
@@ -913,6 +935,12 @@ with tab_portfolio:
         st.session_state["pf_selected_name"] = portfolio_names[0]
     pf_name = st.selectbox("Portfolio", portfolio_names, index=portfolio_names.index(st.session_state["pf_selected_name"]))
     st.session_state["pf_selected_name"] = pf_name
+    _last_saved = last_saved_display()
+    st.caption(
+        ("Saved on this server: " + _last_saved + ". " if _last_saved else "No saved file on this server yet. ")
+        + "Streamlit Cloud storage is ephemeral — a restart or sleep can wipe portfolios, watchlists, and notes. "
+        "Use Export (below) after important changes to keep a permanent copy."
+    )
     new_pf_col1, new_pf_col2, new_pf_col3 = st.columns(3)
     with new_pf_col1:
         new_pf_name = st.text_input("New portfolio name", key="pf_new_name").strip()
@@ -1460,6 +1488,12 @@ with tab_watchlist:
         st.session_state["wl_selected_name"] = watchlist_names[0]
     wl_name = st.selectbox("Watchlist", watchlist_names, index=watchlist_names.index(st.session_state["wl_selected_name"]))
     st.session_state["wl_selected_name"] = wl_name
+    _last_saved_wl = last_saved_display()
+    st.caption(
+        ("Saved on this server: " + _last_saved_wl + ". " if _last_saved_wl else "No saved file on this server yet. ")
+        + "Streamlit Cloud storage is ephemeral — a restart or sleep can wipe portfolios, watchlists, and notes. "
+        "Use Export on the Portfolio tab after important changes to keep a permanent copy."
+    )
     wl_c1, wl_c2, wl_c3 = st.columns(3)
     with wl_c1:
         new_wl_name = st.text_input("New watchlist name", key="wl_new_name").strip()
