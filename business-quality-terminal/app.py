@@ -987,9 +987,138 @@ with st.sidebar:
 st.title("Business Quality Terminal")
 st.caption("Rule #1 Investing / Buffett-style Gatekeeper checklist and valuation.")
 
-tab_lookup, tab_portfolio, tab_watchlist, tab_undervalued, tab_dividends = st.tabs(
-    ["Ticker Lookup", "Portfolio", "Watchlist", "Top 25 Undervalued", "Top 25 + Dividend Growers"]
+tab_dashboard, tab_lookup, tab_portfolio, tab_watchlist, tab_undervalued, tab_dividends = st.tabs(
+    ["Dashboard", "Ticker Lookup", "Portfolio", "Watchlist", "Top 25 Undervalued", "Top 25 + Dividend Growers"]
 )
+
+# --- 0. Dashboard -------------------------------------------------------
+# One screen: what you own, what it's worth, and what needs attention.
+# It checks every holding and watchlist ticker once, reusing the cached
+# snapshots (fundamentals 24h, prices refreshed only if older than
+# 15 minutes), so after the first check of the day it's mostly cache
+# hits. Signal thresholds come from the Portfolio/Watchlist sliders —
+# their session values if you've set them, otherwise the defaults.
+with tab_dashboard:
+    st.caption(
+        "What you own, what it's worth, and what needs attention — across every portfolio and watchlist, "
+        "without opening each tab."
+    )
+    _dash_data = load_user_data()
+    _dash_portfolios = _dash_data.get("portfolios") or {}
+    _dash_watchlists = _dash_data.get("watchlists") or {}
+    _dash_cash = _dash_data.get("portfolio_cash") or {}
+    if not any(_dash_portfolios.values()) and not any(_dash_watchlists.values()):
+        st.info("Nothing to summarize yet — add a holding on the Portfolio tab or a ticker on the Watchlist tab.")
+    else:
+        _approach = float(st.session_state.get("pf_approach", 10))
+        _min_moat_hold = float(st.session_state.get("pf_moat", 40))
+        _max_loss = float(st.session_state.get("pf_loss", 0))
+        _min_moat_buy_pf = float(st.session_state.get("pf_buy_moat", 60))
+        _near_buy_pf = float(st.session_state.get("pf_near", 15))
+        _min_moat_wl = float(st.session_state.get("wl_moat", 60))
+        _near_buy_wl = float(st.session_state.get("wl_near", 15))
+        _dash_value = _dash_cost = _dash_div = _dash_cash_total = 0.0
+        _pf_counts: Counter = Counter()
+        _wl_counts: Counter = Counter()
+        _attention: List[Dict[str, Any]] = []
+        _dash_price_dates: List[Any] = []
+        _pf_rows: List[Dict[str, Any]] = []
+        with st.spinner("Checking your holdings and watchlist..."):
+            for _pf_name, _holdings in _dash_portfolios.items():
+                _pf_cash = float(_dash_cash.get(_pf_name, 0.0))
+                _dash_cash_total += _pf_cash
+                _pf_value = _pf_cost = _pf_div = 0.0
+                _pf_sig_counts: Counter = Counter()
+                for _h in _holdings:
+                    _snap = build_snapshot(_h["ticker"], price_max_age=TRACKING_PRICE_MAX_AGE)
+                    if _snap.get("error"):
+                        _pf_counts["NO DATA"] += 1
+                        _pf_sig_counts["NO DATA"] += 1
+                        _attention.append({"Where": _pf_name, "Ticker": _h["ticker"], "Signal": "NO DATA", "Why": _short_why(_snap["error"])})
+                        continue
+                    if _snap.get("price_date"):
+                        _dash_price_dates.append(_snap["price_date"])
+                    _val = valuation_from_snapshot(_snap, discount_rate, max_growth)
+                    _sig = portfolio_signal(
+                        _snap, _val, _h.get("avg_cost"), _approach, _min_moat_hold, _max_loss,
+                        _min_moat_buy_pf, _near_buy_pf,
+                    )
+                    _pf_counts[_sig["signal"]] += 1
+                    _pf_sig_counts[_sig["signal"]] += 1
+                    _price = _snap["current_price"]
+                    _value = _price * _h["shares"] if _h.get("shares") else None
+                    if _value is not None:
+                        _pf_value += _value
+                    if _h.get("shares") and _h.get("avg_cost"):
+                        _pf_cost += _h["shares"] * _h["avg_cost"]
+                    _manual_dash = _manual_for(_h["ticker"])
+                    _dps_dash = _manual_dash.get("dividend_per_share") if "dividend_per_share" in _manual_dash else _snap.get("dividend_per_share")
+                    _div_dash = _h["shares"] * _dps_dash if (_h.get("shares") and _dps_dash) else None
+                    if _div_dash is not None:
+                        _pf_div += _div_dash
+                    if _sig["signal"] in ("SELL", "REVIEW"):
+                        _attention.append({
+                            "Where": _pf_name, "Ticker": _h["ticker"], "Signal": _sig["signal"],
+                            "Why": _short_why("; ".join(_sig["reasons"])),
+                        })
+                _dash_value += _pf_value
+                _dash_cost += _pf_cost
+                _dash_div += _pf_div
+                _pf_rows.append({
+                    "Portfolio": _pf_name, "Holdings": len(_holdings),
+                    "Value": money(_pf_value), "Cash": money(_pf_cash),
+                    "Gain/Loss": money(_pf_value - _pf_cost) if _pf_cost else "—",
+                    "Div income/yr": money(_pf_div) if _pf_div else "—",
+                    "BUY": _pf_sig_counts.get("BUY", 0), "REVIEW": _pf_sig_counts.get("REVIEW", 0),
+                    "SELL": _pf_sig_counts.get("SELL", 0),
+                })
+            for _wl_name, _tickers in _dash_watchlists.items():
+                for _t in _tickers:
+                    _snap = build_snapshot(_t, price_max_age=TRACKING_PRICE_MAX_AGE)
+                    if _snap.get("error"):
+                        _wl_counts["NO DATA"] += 1
+                        continue
+                    if _snap.get("price_date"):
+                        _dash_price_dates.append(_snap["price_date"])
+                    _val = valuation_from_snapshot(_snap, discount_rate, max_growth)
+                    _sig = buy_signal(_snap, _val, _min_moat_wl, _near_buy_wl)
+                    _wl_counts[_sig["signal"]] += 1
+                    if _sig["signal"] in ("BUY", "NEAR BUY"):
+                        _attention.append({
+                            "Where": f"Watchlist '{_wl_name}'", "Ticker": _t, "Signal": _sig["signal"],
+                            "Why": _short_why("; ".join(_sig["reasons"])),
+                        })
+        _m1, _m2, _m3, _m4 = st.columns(4)
+        with _m1:
+            st.metric("Total account value", money(_dash_value + _dash_cash_total))
+        with _m2:
+            _gain = _dash_value - _dash_cost
+            _gain_pct = (_gain / _dash_cost * 100) if _dash_cost else None
+            st.metric("Total gain/loss", money(_gain) if _dash_cost else "—", delta=None if _gain_pct is None else f"{_gain_pct:+.1f}% vs cost")
+        with _m3:
+            st.metric("Cash", money(_dash_cash_total))
+        with _m4:
+            st.metric("Dividend income/yr", money(_dash_div) if _dash_div else "—")
+        if _pf_rows:
+            st.dataframe(pd.DataFrame(_pf_rows), hide_index=True, use_container_width=True)
+        st.caption(
+            "Portfolio signals: " + (" · ".join(f"{n} {s}" for s, n in _pf_counts.most_common()) if _pf_counts else "no holdings")
+            + "  |  Watchlist signals: " + (" · ".join(f"{n} {s}" for s, n in _wl_counts.most_common()) if _wl_counts else "no tickers")
+        )
+        if _attention:
+            st.subheader("Needs attention")
+            st.dataframe(pd.DataFrame(_attention), hide_index=True, use_container_width=True)
+        else:
+            st.success("Nothing needs attention right now — no SELL or REVIEW holdings, and no watchlist ticker at its buy price.")
+        _as_of_dash = _prices_as_of_caption(_dash_price_dates)
+        if _as_of_dash:
+            st.caption(_as_of_dash)
+        st.caption(
+            "Signals use your Portfolio/Watchlist slider settings (or their defaults if you haven't changed them "
+            "this session). Gain/loss and dividend income count only holdings with shares and a cost / dividend "
+            "per share recorded. Totals include cash across all portfolios."
+        )
+
 
 # --- 1. Ticker Lookup ----------------------------------------------------
 with tab_lookup:
