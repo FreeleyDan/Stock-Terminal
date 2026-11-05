@@ -1564,6 +1564,8 @@ with tab_watchlist:
         _table_downloads(df, f"wl_{wl_name}", f"{wl_name}_watchlist")
         counts = Counter(r["Signal"] for r in rows)
         st.caption(" \u00b7 ".join(f"{n} {s}" for s, n in counts.most_common()))
+        st.caption("Add a watchlist ticker to a portfolio — shares and cost stay blank until you set them on the Portfolio tab.")
+        _add_to_portfolio_controls([r["Ticker"] for r in rows], f"wl_{wl_name}")
         # Wash-sale watch for watchlist tickers too: if you buy a
         # ticker in a taxable account within 30 days of selling it at
         # a loss, the loss may be disallowed.
@@ -1587,6 +1589,51 @@ with tab_watchlist:
 
 
 # --- 4 & 5. Market scanner --------------------------------------------------
+def _add_ticker_to_portfolio(ticker: str, pf_name: str) -> str:
+    """Add one ticker to a named portfolio, blank shares/cost for the
+    user to fill in on the Portfolio tab. Returns "added", "already",
+    or "failed". The cached portfolio editor frame is dropped so the
+    Portfolio tab rebuilds it from the saved file (the editor
+    auto-saves on every change, so no in-progress edit is lost)."""
+    ticker = normalize_ticker(ticker or "")
+    if not ticker:
+        return "failed"
+    data = load_user_data()
+    portfolios = dict(data.get("portfolios") or {})
+    holdings = list(portfolios.get(pf_name, []))
+    if any(normalize_ticker(h.get("ticker", "")) == ticker for h in holdings):
+        return "already"
+    holdings.append({"ticker": ticker, "shares": None, "avg_cost": None})
+    if not save_portfolio(holdings, name=pf_name):
+        return "failed"
+    st.session_state.pop(f"portfolio_df_{pf_name}", None)
+    st.session_state.pop(f"portfolio_saved_{pf_name}", None)
+    return "added"
+
+
+def _add_to_portfolio_controls(tickers: List[str], key_suffix: str) -> None:
+    """Ticker + portfolio pickers and an Add button, shared by the
+    Watchlist tab and the ranked (Top 25 / Dividend) tables."""
+    if not tickers:
+        return
+    data = load_user_data()
+    portfolio_names = list((data.get("portfolios") or {"Main": []}).keys()) or ["Main"]
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        pick_ticker = st.selectbox("Ticker", tickers, key=f"add_pf_ticker_{key_suffix}")
+    with c2:
+        pick_pf = st.selectbox("Add to portfolio", portfolio_names, key=f"add_pf_name_{key_suffix}")
+    with c3:
+        if st.button("Add to portfolio", key=f"add_pf_btn_{key_suffix}"):
+            result = _add_ticker_to_portfolio(pick_ticker, pick_pf)
+            if result == "added":
+                st.success(f"Added {pick_ticker} to '{pick_pf}' — set shares and cost on the Portfolio tab.")
+            elif result == "already":
+                st.warning(f"{pick_ticker} is already in '{pick_pf}'.")
+            else:
+                st.warning("Couldn't write user_data.json — changes won't persist after a restart.")
+
+
 def _pct_or_dash(v: Any) -> str:
     return "\u2014" if v is None else f"{v:.1%}"
 
@@ -1783,12 +1830,57 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
             for reason, n in reasons.most_common():
                 sample = [t for t, m in scan["errors"].items() if m == reason][:12]
                 st.write(f"**{n}** \u00d7 {reason}  \u2014  e.g. {', '.join(sample)}")
+    # Tickers that had usable data but still couldn't be valued — the
+    # gap between "had usable data" and "could be valued" in the caption
+    # above. Same four branches as valuation_from_snapshot, grouped so
+    # the reason is visible instead of a silent absence from the table.
+    # Computed over this tab's filtered snapshot set, matching the
+    # ranking above.
+    unvalued: Dict[str, List[str]] = {}
+    for snap in snapshots_for_rank:
+        if snap.get("error"):
+            continue
+        eps = snap.get("current_eps")
+        growth = snap.get("growth_rate")
+        pe = snap.get("historical_pe")
+        if eps is None or eps <= 0:
+            reason = "EPS is zero or negative, so no Sticker Price"
+        elif growth is None:
+            reason = "Not enough EPS history to estimate growth"
+        elif growth <= 0:
+            reason = "EPS hasn't been growing, so no Sticker Price"
+        elif pe is None:
+            reason = "No historical P/E (couldn't pair past EPS with past prices)"
+        else:
+            continue
+        unvalued.setdefault(reason, []).append(snap.get("ticker") or "?")
+    if unvalued:
+        total_unvalued = sum(len(v) for v in unvalued.values())
+        with st.expander(f"{total_unvalued} tickers had data but couldn't be valued \u2014 why"):
+            st.caption(
+                "These are not fetch failures (those are in the skipped-tickers expander above) — the filings "
+                "came back, but the Rule #1 Sticker can't be computed for them. A loss-maker, a company with no "
+                "EPS growth history, or one whose past EPS can't be paired with past prices simply has no Sticker "
+                "here; that is a limitation of the method, not a buy or sell signal."
+            )
+            for reason, tickers in sorted(unvalued.items(), key=lambda kv: -len(kv[1])):
+                st.write(f"**{len(tickers)}** \u00d7 {reason}  \u2014  e.g. {', '.join(tickers[:12])}")
+    if ranked["top_results"]:
+        st.caption("Add a result to a portfolio — shares and cost stay blank until you set them on the Portfolio tab.")
+        _add_to_portfolio_controls([r["ticker"] for r in ranked["top_results"]], download_key)
 
 
 with tab_undervalued:
     st.caption(
         "Scans a universe and ranks wonderful businesses first, then by how far each stock trades below its "
         "Sticker Price. Results are cached, so you can stop a scan and click Scan again to resume. " + DISCLAIMER
+    )
+    st.caption(
+        "Read this list as a valuation discipline, not a buy signal on its own. Backtests of this exact method "
+        "on the S&P 500, 2010\u20132020 (local, 2026-11-04): a Sticker at a 50% margin of safety, with the Big Five "
+        "quality gate, did not beat the S&P 500 \u2014 it landed a few points a year behind it, and concentrating on "
+        "the 3 most undervalued names made it no better. The names here are worth a closer look only if you "
+        "understand the business behind them."
     )
     # Restore the last saved scan on a fresh session (Cloud may still wipe
     # the file on sleep/restart — the CSV download below is the durable copy).
