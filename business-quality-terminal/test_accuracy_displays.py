@@ -111,7 +111,7 @@ def main():
               "_project_drip_income", "_projected_income_at_year", "_years_to_goal",
               "_dividend_payment_cut", "_payout_jump_check",
               "_income_attribution", "_observed_income_growth", "_years_to_goal_observed",
-              "_record_goal_month", "_display_purchase_date"}
+              "_record_goal_month", "_display_purchase_date", "_scan_for_universe"}
     import statistics as _statistics
     import math as _math
     ns: Dict[str, Any] = {
@@ -139,6 +139,7 @@ def main():
     m._record_goal_month = ns["_record_goal_month"]
     m._parse_purchase_date = ns["_parse_purchase_date"]
     m._display_purchase_date = ns["_display_purchase_date"]
+    m._scan_for_universe = ns["_scan_for_universe"]
     # Purchase dates: MM-DD-YYYY is what the editor shows, YYYY-MM-DD is
     # what storage holds; both must parse, storage stays ISO.
     assert m._parse_purchase_date("01-15-2024") == _date(2024, 1, 15), "MM-DD-YYYY parses"
@@ -150,6 +151,33 @@ def main():
     assert m._display_purchase_date("2024-01-15") == "01-15-2024", "stored ISO displays MM-DD-YYYY"
     assert m._display_purchase_date("01-15-2024") == "01-15-2024", "typed MM-DD-YYYY displays unchanged"
     assert m._display_purchase_date(None) == "" and m._display_purchase_date("") == ""
+    # Universe filter: switching the radio filters the stored scan.
+    _all_scan = {"label": "All NYSE + Nasdaq stocks", "done": 4, "total": 4,
+                 "snapshots": [{"ticker": "AAPL"}, {"ticker": "MSFT"}, {"ticker": "TSLA"}, {"ticker": "XYZ"}],
+                 "errors": {"XYZ": "no data", "AAPL": "stale"}}
+    ns["get_sp500_tickers"] = lambda: ["AAPL", "MSFT"] + [f"SP{i}" for i in range(100)]
+    ns["parse_ticker_list"] = lambda raw: [t.strip().upper() for t in raw.replace("\n", ",").split(",") if t.strip()]
+    _view, _note, _filt = m._scan_for_universe(_all_scan, "S&P 500")
+    assert _filt is True and [s["ticker"] for s in _view["snapshots"]] == ["AAPL", "MSFT"], _view
+    assert _view["errors"] == {"AAPL": "stale"}, _view["errors"]
+    assert "S&P 500 members" in _note and "2 of 4" in _note, _note
+    assert len(_all_scan["snapshots"]) == 4, "stored scan must not be mutated"
+    _view2, _note2, _filt2 = m._scan_for_universe(_all_scan, "All NYSE + Nasdaq stocks")
+    assert _view2 is _all_scan and _note2 is None and _filt2 is False, "matching universe shows as-is"
+    _sp_scan = dict(_all_scan, label="S&P 500")
+    _view3, _note3, _filt3 = m._scan_for_universe(_sp_scan, "All NYSE + Nasdaq stocks")
+    assert _view3 is _sp_scan and _filt3 is False and "full All NYSE + Nasdaq scan" in _note3, _note3
+    _view4, _note4, _filt4 = m._scan_for_universe(_all_scan, "Custom list", "AAPL, XYZ")
+    assert _filt4 is True and [s["ticker"] for s in _view4["snapshots"]] == ["AAPL", "XYZ"], _view4
+    _view5, _note5, _filt5 = m._scan_for_universe(_all_scan, "Custom list", "")
+    assert _view5 is _all_scan and _filt5 is False and "Enter tickers" in _note5, _note5
+    _nolabel = dict(_all_scan)
+    _nolabel.pop("label")
+    _view6, _note6, _filt6 = m._scan_for_universe(_nolabel, "S&P 500")
+    assert _view6 is _nolabel and _note6 is None and _filt6 is False, "no label -> no filter"
+    ns["get_sp500_tickers"] = lambda: ["AAPL", "MSFT"]
+    _view7, _note7, _filt7 = m._scan_for_universe(_all_scan, "S&P 500")
+    assert _view7 is _all_scan and _filt7 is False and "Couldn't fetch" in _note7, "tiny fallback list must not filter"
     # Income attribution: buys + raises must sum to the income change.
     _b, _r = m._income_attribution(110.0, 2.0, 100.0, 2.0)
     assert (_b, _r) == (20.0, 0.0), (_b, _r)

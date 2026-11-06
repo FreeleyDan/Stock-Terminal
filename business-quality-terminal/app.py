@@ -2604,6 +2604,46 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
     return ranked
 
 
+def _scan_for_universe(scan: Dict[str, Any], choice: str, custom_text: str = "") -> Any:
+    """Return (scan_view, note, was_filtered) for the selected universe.
+    The stored scan keeps the universe it was run with (scan["label"]).
+    When the radio picks a different universe, the view is filtered to
+    that universe's members instead of showing the whole stored scan —
+    the stored scan itself is never changed, so switching the radio back
+    restores the full table. No filtering when the universes match, when
+    the stored scan has no label, or when the selected universe is All
+    NYSE + Nasdaq (a superset of any scan — only a note, prompting a
+    fresh scan for the full list)."""
+    _label = scan.get("label")
+    if not _label or _label == choice:
+        return scan, None, False
+    if choice == "All NYSE + Nasdaq stocks":
+        return scan, (
+            f"Showing your saved {_label} scan — click Scan to run the full All NYSE + Nasdaq scan."
+        ), False
+    if choice == "S&P 500":
+        _members = set(get_sp500_tickers())
+        if len(_members) <= 60:
+            # Live S&P 500 list couldn't be fetched (fallback list) — a
+            # filter on ~50 tickers would hide most of the scan.
+            return scan, (
+                "Couldn't fetch the live S&P 500 list, so the saved scan is shown unfiltered."
+            ), False
+    else:
+        _members = set(parse_ticker_list(custom_text))
+    if not _members:
+        return scan, "Enter tickers in the Custom list box above to filter the saved scan to your list.", False
+    _view = dict(scan)
+    _view["snapshots"] = [s for s in (scan.get("snapshots") or []) if s.get("ticker") in _members]
+    _view["errors"] = {t: m for t, m in (scan.get("errors") or {}).items() if t in _members}
+    _note = (
+        f"Showing only the {choice} members of your saved {_label} scan "
+        f"({len(_view['snapshots'])} of {len(scan.get('snapshots') or [])} tickers with data) — "
+        f"click Scan to run a fresh {choice} scan."
+    )
+    return _view, _note, True
+
+
 with tab_undervalued:
     st.caption(
         "Scans a universe and ranks wonderful businesses first, then by how far each stock trades below its "
@@ -2705,11 +2745,16 @@ with tab_undervalued:
         min_cap_scan = float(uv_p.get("min_cap_b", 0))
         st.caption(f"Using preset '{uv_preset_name}' — sliders are ignored until you switch back to (sliders).")
     if "scan" in st.session_state:
-        ranked_now = render_ranked_table(st.session_state["scan"], 0, float(min_moat_scan), quality_first=quality_first_scan, download_key="scan_csv", min_market_cap_b=float(min_cap_scan))
+        _scan_view, _scan_note, _scan_filtered = _scan_for_universe(st.session_state["scan"], choice, custom_text)
+        if _scan_note:
+            st.caption(_scan_note)
+        ranked_now = render_ranked_table(_scan_view, 0, float(min_moat_scan), quality_first=quality_first_scan, download_key="scan_csv", min_market_cap_b=float(min_cap_scan))
         # Refresh the stored top 25 for the next scan's diff, then show
         # the diff against the previous scan (if this session has one).
+        # No diff on a filtered view: it compares two different universes.
         st.session_state["prev_top25"] = {r["ticker"]: r["undervalued_pct"] for r in ranked_now["top_results"]}
-        _render_scan_diff(st.session_state.get("scan_diff_prev"), st.session_state["prev_top25"])
+        if not _scan_filtered:
+            _render_scan_diff(st.session_state.get("scan_diff_prev"), st.session_state["prev_top25"])
     else:
         st.info("Pick a universe and click Scan.")
 
@@ -2840,8 +2885,13 @@ with tab_dividends:
             else:
                 st.warning("Enter a ticker with saved manual data first.")
     if "scan" in st.session_state:
+        _div_choice = st.session_state.get("scan_universe_choice", "S&P 500")
+        _div_custom = st.session_state.get("scan_custom", "")
+        _scan_view, _scan_note, _scan_filtered = _scan_for_universe(st.session_state["scan"], _div_choice, _div_custom)
+        if _scan_note:
+            st.caption(_scan_note)
         render_ranked_table(
-            st.session_state["scan"], int(div_years), float(min_moat_div), quality_first=quality_first_div,
+            _scan_view, int(div_years), float(min_moat_div), quality_first=quality_first_div,
             download_key="div_csv", dividend_mode=True, max_payout=float(max_payout_div),
             min_div_growth=float(min_div_growth_div), min_chowder=float(min_chowder_div),
             min_market_cap_b=float(min_cap_div),
