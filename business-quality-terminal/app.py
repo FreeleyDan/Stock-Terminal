@@ -443,13 +443,24 @@ def _format_market_cap(value: Optional[float]) -> str:
 
 
 def _parse_purchase_date(text: Any) -> Optional[date]:
-    """Parse a YYYY-MM-DD purchase date from the editor, or None."""
+    """Parse a purchase date from the editor, or None.
+    Accepts MM-DD-YYYY (what the editor shows) and YYYY-MM-DD (what
+    storage holds and what older values look like)."""
     if text is None or str(text).strip() in ("", "nan", "None"):
         return None
-    try:
-        return datetime.strptime(str(text).strip()[:10], "%Y-%m-%d").date()
-    except Exception:
-        return None
+    _t = str(text).strip()[:10]
+    for _fmt in ("%m-%d-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(_t, _fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+def _display_purchase_date(value: Any) -> str:
+    """Stored purchase dates are YYYY-MM-DD; the UI shows MM-DD-YYYY."""
+    _d = _parse_purchase_date(value)
+    return _d.strftime("%m-%d-%Y") if _d else ""
 
 
 def _tax_term(purchase_date_str: Optional[str], sale: Optional[date] = None) -> Dict[str, Any]:
@@ -1753,7 +1764,7 @@ with tab_portfolio:
         frame = pd.DataFrame(
             [{"Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": h["avg_cost"],
               "Target %": h.get("target_pct"), "DRIP": bool(h.get("drip")),
-              "Purchase Date": h.get("purchase_date") or ""} for h in saved_pf],
+              "Purchase Date": _display_purchase_date(h.get("purchase_date"))} for h in saved_pf],
             columns=["Ticker", "Shares", "Avg Cost", "Target %", "DRIP", "Purchase Date"],
         )
         frame["Shares"] = pd.to_numeric(frame["Shares"], errors="coerce").astype("float64")
@@ -1779,7 +1790,7 @@ with tab_portfolio:
                 "Avg Cost": st.column_config.NumberColumn("Avg Cost", min_value=0.0, format="$%.2f"),
                 "Target %": st.column_config.NumberColumn("Target % of account (blank = no target)", min_value=0.0, max_value=100.0),
                 "DRIP": st.column_config.CheckboxColumn("DRIP (dividends reinvested)"),
-                "Purchase Date": st.column_config.TextColumn("Purchase Date (YYYY-MM-DD, blank = unknown)"),
+                "Purchase Date": st.column_config.TextColumn("Purchase Date (MM-DD-YYYY, blank = unknown)"),
             },
         )
         st.caption("Purchase Date is a single-lot assumption: if you bought a holding in multiple lots at different times, one date cannot split long-term vs short-term per lot. Tax columns below use this date, and only for Taxable portfolios.")
@@ -1858,7 +1869,7 @@ with tab_portfolio:
                 # cost per share is / the ratio.
                 for _sp in _splits_after_purchase(snap.get("splits"), h.get("purchase_date")):
                     review_reasons.append(
-                        f"Split {_sp['ratio']:g}-for-1 on {_sp['date']} after your {h.get('purchase_date')} purchase — "
+                        f"Split {_sp['ratio']:g}-for-1 on {_sp['date']} after your {_display_purchase_date(h.get('purchase_date'))} purchase — "
                         f"check shares (x{_sp['ratio']:g}) and cost (÷{_sp['ratio']:g}) are post-split"
                     )
                     review_urgency = min(review_urgency, 1)
@@ -2120,7 +2131,11 @@ with tab_portfolio:
                     other_sum = sum(e["gain"] for e in year_sales if e.get("term") not in ("Long-term", "Short-term") and e.get("gain") is not None)
                     summary_rows.append({"Year": year, "Long-term gain/loss": money(lt_sum), "Short-term gain/loss": money(st_sum), "Unknown-term gain/loss": money(other_sum), "Net": money(lt_sum + st_sum + other_sum), "Sales": len(year_sales)})
                 st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
-                st.dataframe(pd.DataFrame(filtered_sales[::-1]), hide_index=True, use_container_width=True)
+                _sales_display = pd.DataFrame(filtered_sales[::-1])
+                for _dc in ("date", "purchase_date"):
+                    if _dc in _sales_display.columns:
+                        _sales_display[_dc] = _sales_display[_dc].map(_display_purchase_date)
+                st.dataframe(_sales_display, hide_index=True, use_container_width=True)
                 st.download_button(
                     "Download sales log (CSV)", data=pd.DataFrame(filtered_sales).to_csv(index=False),
                     file_name="sales_log.csv", mime="text/csv", key=f"sale_log_csv_{pf_name}",

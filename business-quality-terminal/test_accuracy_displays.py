@@ -111,7 +111,7 @@ def main():
               "_project_drip_income", "_projected_income_at_year", "_years_to_goal",
               "_dividend_payment_cut", "_payout_jump_check",
               "_income_attribution", "_observed_income_growth", "_years_to_goal_observed",
-              "_record_goal_month"}
+              "_record_goal_month", "_display_purchase_date"}
     import statistics as _statistics
     import math as _math
     ns: Dict[str, Any] = {
@@ -137,6 +137,19 @@ def main():
     m._observed_income_growth = ns["_observed_income_growth"]
     m._years_to_goal_observed = ns["_years_to_goal_observed"]
     m._record_goal_month = ns["_record_goal_month"]
+    m._parse_purchase_date = ns["_parse_purchase_date"]
+    m._display_purchase_date = ns["_display_purchase_date"]
+    # Purchase dates: MM-DD-YYYY is what the editor shows, YYYY-MM-DD is
+    # what storage holds; both must parse, storage stays ISO.
+    assert m._parse_purchase_date("01-15-2024") == _date(2024, 1, 15), "MM-DD-YYYY parses"
+    assert m._parse_purchase_date("1-5-2024") == _date(2024, 1, 5), "no leading zeros parse"
+    assert m._parse_purchase_date("2024-01-15") == _date(2024, 1, 15), "ISO still parses"
+    assert m._parse_purchase_date("13-01-2024") is None, "month 13 is not a date"
+    assert m._parse_purchase_date("02-30-2024") is None, "Feb 30 is not a date"
+    assert m._parse_purchase_date("") is None and m._parse_purchase_date(None) is None
+    assert m._display_purchase_date("2024-01-15") == "01-15-2024", "stored ISO displays MM-DD-YYYY"
+    assert m._display_purchase_date("01-15-2024") == "01-15-2024", "typed MM-DD-YYYY displays unchanged"
+    assert m._display_purchase_date(None) == "" and m._display_purchase_date("") == ""
     # Income attribution: buys + raises must sum to the income change.
     _b, _r = m._income_attribution(110.0, 2.0, 100.0, 2.0)
     assert (_b, _r) == (20.0, 0.0), (_b, _r)

@@ -349,6 +349,9 @@ check("goal history drops the oldest months", d["dividend_goal_history"][0]["mon
 check("save holdings baseline", storage.save_holdings_baseline({"KO": {"shares": 100.0, "dps": 2.0, "income": 200.0, "date": "2026-11-05"}}, path=p))
 d = storage.load_user_data(p)
 check("holdings baseline round-trips", d.get("holdings_baseline"), {"KO": {"shares": 100.0, "dps": 2.0, "income": 200.0, "date": "2026-11-05"}})
+check("parse_date accepts MM-DD-YYYY, normalizes to ISO", storage._parse_date("01-15-2024"), "2024-01-15")
+check("parse_date keeps YYYY-MM-DD", storage._parse_date("2024-01-15"), "2024-01-15")
+check("parse_date rejects a bad month", storage._parse_date("13-01-2024"), None)
 check("record goal month with attribution",
       storage.record_dividend_goal_month("2026-11", 5200.0, 12000.0, buys=300.0, raises=50.0, path=p)
       and storage.load_user_data(p).get("dividend_goal_history")[-1],

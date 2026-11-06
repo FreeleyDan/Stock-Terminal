@@ -62,7 +62,8 @@ def _empty() -> Dict[str, Any]:
 
 def _parse_date(value: Any) -> Optional[str]:
     """Normalize a date to YYYY-MM-DD, or None if it is not a real date.
-    Accepts 'YYYY-MM-DD' strings and date/datetime objects."""
+    Accepts 'YYYY-MM-DD' and 'MM-DD-YYYY' strings and date/datetime
+    objects. Storage stays YYYY-MM-DD; the UI shows MM-DD-YYYY."""
     if value is None or value == "":
         return None
     if hasattr(value, "strftime"):
@@ -71,11 +72,13 @@ def _parse_date(value: Any) -> Optional[str]:
         except Exception:
             return None
     text = str(value).strip()[:10]
-    try:
-        from datetime import datetime as _dt
-        return _dt.strptime(text, "%Y-%m-%d").strftime("%Y-%m-%d")
-    except Exception:
-        return None
+    from datetime import datetime as _dt
+    for _fmt in ("%Y-%m-%d", "%m-%d-%Y"):
+        try:
+            return _dt.strptime(text, _fmt).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    return None
 
 
 def _clean_holding(row: Any) -> Optional[Dict[str, Any]]:
