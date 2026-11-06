@@ -163,13 +163,78 @@ def _error(ticker: str, message: str, kind: str) -> Dict[str, Any]:
     return {"ticker": ticker, "error": message, "error_kind": kind}
 
 
+def _fund_snapshot(ticker: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Yahoo-only snapshot for a fund/ETF the SEC has no 10-K for: price
+    and trailing-12-month distributions. No Sticker, Moat, or signal —
+    the snapshot says so (is_fund), and every consumer must check it
+    before touching stock-only fields. Returns (snapshot, where_to_cache)
+    like _evaluate."""
+    bundle, pstatus = get_price_history(ticker)
+    if bundle is None:
+        if pstatus == "empty":
+            return _error(ticker, "No SEC filings and no Yahoo price data — check the ticker", PERMANENT), "full"
+        return _error(ticker, "Couldn't reach Yahoo Finance (try again shortly)", TRANSIENT), None
+    ttm_dps = bundle.get("ttm_dividends")
+    price = bundle["last_close"]
+    return {
+        "ticker": ticker,
+        "name": None,
+        "error": None,
+        "error_kind": None,
+        "is_fund": True,
+        "current_price": price,
+        "price_date": bundle["last_date"],
+        "price_asof": time.time(),
+        "current_eps": None,
+        "growth_rate": None,
+        "historical_pe": None,
+        "moat_score": None,
+        "gatekeeper": None,
+        "dividend_streak": 0,
+        "split_count": len(bundle["splits"]),
+        "owner_earnings": None,
+        "shares_history": {},
+        "free_cash_flow": None,
+        "net_income": None,
+        "sbc": None,
+        "sbc_adjusted_fcf": None,
+        "interest_expense": None,
+        "operating_income": None,
+        "interest_coverage": None,
+        "total_debt": None,
+        "maintenance_capex_est": None,
+        "audit_series": {},
+        "splits": bundle["splits"],
+        "dividend_payments": bundle.get("dividends") or [],
+        "roic_dropped": {},
+        "tag_used": {},
+        "dividend_per_share": ttm_dps,
+        "dividend_yield": (ttm_dps / price) if (ttm_dps and price) else None,
+        "dividend_growth_5yr": None,
+        "dividend_growth_10yr": None,
+        "payout_ratio": None,
+        "chowder": None,
+        "years_to_10pct_yield_on_cost": None,
+        "fcf_dividend_coverage": None,
+        "ttm_used": False,
+        "ttm_as_of": None,
+        "annual_eps": None,
+        "last_fy_end": None,
+    }, "full"
+
+
 def _evaluate(ticker: str, prune_unvaluable: bool) -> Tuple[Dict[str, Any], Optional[str]]:
     """Returns (snapshot, where_to_cache) with where_to_cache in
     {"full", "pruned", None}. Transient failures are never cached."""
     raw, status = fetch_raw_companyfacts(ticker)
     if raw is None:
         if status == "not_covered":
-            return _error(ticker, "No SEC filings found (not a US 10-K filer, or ticker unknown)", PERMANENT), "full"
+            if prune_unvaluable:
+                # Scan mode: no Yahoo call for a ticker that can't be
+                # valued anyway — the fund path is for single-ticker
+                # and portfolio use, not for scanning a universe.
+                return _error(ticker, "No SEC filings found (not a US 10-K filer, or ticker unknown)", PERMANENT), "full"
+            return _fund_snapshot(ticker)
         return _error(ticker, "Couldn't reach SEC EDGAR (try again shortly)", TRANSIENT), None
 
     try:
@@ -346,6 +411,12 @@ def valuation_from_snapshot(
         "action": None,
         "note": None,
     }
+    if snapshot.get("is_fund"):
+        # Funds never get a Sticker, and determine_action's conservative
+        # fallback (OVERPRICED_AVOID when inputs are missing) would be a
+        # false "avoid" — so no action at all.
+        out["note"] = "Fund — no Sticker Price (not a 10-K filer)"
+        return out
     price = snapshot.get("current_price")
     eps = snapshot.get("current_eps")
     growth = snapshot.get("growth_rate")

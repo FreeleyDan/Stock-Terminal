@@ -969,10 +969,58 @@ def _pct_or_dash(v: Any) -> str:
 
 
 
+def _card_add_controls(ticker: str) -> None:
+    """One-tap add from the ticker card, same as the tables: pick a
+    portfolio / watchlist and the ticker lands there with blank
+    shares/cost."""
+    st.caption("Add this ticker to a portfolio or watchlist — shares and cost stay blank until you set them on the Portfolio tab.")
+    card_c1, card_c2 = st.columns(2)
+    with card_c1:
+        pf_names_card = list((load_user_data().get("portfolios") or {"Main": []}).keys()) or ["Main"]
+        pick_pf_card = st.selectbox("Portfolio", pf_names_card, key=f"card_pf_{ticker}")
+        if st.button("Add to portfolio", key=f"card_add_pf_{ticker}"):
+            card_pf_result = _add_ticker_to_portfolio(ticker, pick_pf_card)
+            if card_pf_result == "added":
+                st.success(f"Added {ticker} to '{pick_pf_card}'.")
+            elif card_pf_result == "already":
+                st.warning(f"{ticker} is already in '{pick_pf_card}'.")
+            else:
+                st.warning("Couldn't write user_data.json — changes won't persist after a restart.")
+    with card_c2:
+        wl_names_card = list((load_user_data().get("watchlists") or {"Main": []}).keys()) or ["Main"]
+        pick_wl_card = st.selectbox("Watchlist", wl_names_card, key=f"card_wl_{ticker}")
+        if st.button("Add to watchlist", key=f"card_add_wl_{ticker}"):
+            card_wl_result = _add_ticker_to_watchlist(ticker, pick_wl_card)
+            if card_wl_result == "added":
+                st.success(f"Added {ticker} to watchlist '{pick_wl_card}'.")
+            elif card_wl_result == "already":
+                st.warning(f"{ticker} is already in watchlist '{pick_wl_card}'.")
+            else:
+                st.warning("Couldn't write user_data.json — changes won't persist after a restart.")
+
+
 def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str, Any]], max_growth: float, discount_rate: float = 0.15) -> None:
     st.subheader(ticker + (f" \u2014 {snap['name']}" if snap.get("name") else ""))
     if snap.get("error"):
         st.warning(f"{ticker}: {snap['error']}")
+        st.divider()
+        return
+    if snap.get("is_fund"):
+        # Funds: price and distributions from Yahoo only — no Sticker,
+        # Moat, checklist, or signal. The add controls still apply.
+        _fcols = st.columns(3)
+        with _fcols[0]:
+            st.markdown(render_metric_box("Current Price", money(snap["current_price"]), "metric-neutral"), unsafe_allow_html=True)
+        with _fcols[1]:
+            st.markdown(render_metric_box("Distributions / share (TTM)", money(snap.get("dividend_per_share")), "metric-neutral"), unsafe_allow_html=True)
+        with _fcols[2]:
+            _fy = snap.get("dividend_yield")
+            st.markdown(render_metric_box("Yield (TTM)", "—" if _fy is None else f"{_fy:.1%}", "metric-neutral"), unsafe_allow_html=True)
+        st.caption(
+            "Fund — no Sticker Price, Moat, or signal. The SEC has no 10-K for this ticker, so price and "
+            f"distributions come from Yahoo (last close {snap.get('price_date', '')})."
+        )
+        _card_add_controls(ticker)
         st.divider()
         return
 
@@ -1040,32 +1088,7 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
         st.caption(val["note"])
     st.dataframe(build_checklist_dataframe(snap["gatekeeper"]), hide_index=True, use_container_width=True)
 
-    # One-tap add from the card, same as the tables: pick a portfolio /
-    # watchlist and the ticker lands there with blank shares/cost.
-    st.caption("Add this ticker to a portfolio or watchlist — shares and cost stay blank until you set them on the Portfolio tab.")
-    card_c1, card_c2 = st.columns(2)
-    with card_c1:
-        pf_names_card = list((load_user_data().get("portfolios") or {"Main": []}).keys()) or ["Main"]
-        pick_pf_card = st.selectbox("Portfolio", pf_names_card, key=f"card_pf_{ticker}")
-        if st.button("Add to portfolio", key=f"card_add_pf_{ticker}"):
-            card_pf_result = _add_ticker_to_portfolio(ticker, pick_pf_card)
-            if card_pf_result == "added":
-                st.success(f"Added {ticker} to '{pick_pf_card}'.")
-            elif card_pf_result == "already":
-                st.warning(f"{ticker} is already in '{pick_pf_card}'.")
-            else:
-                st.warning("Couldn't write user_data.json — changes won't persist after a restart.")
-    with card_c2:
-        wl_names_card = list((load_user_data().get("watchlists") or {"Main": []}).keys()) or ["Main"]
-        pick_wl_card = st.selectbox("Watchlist", wl_names_card, key=f"card_wl_{ticker}")
-        if st.button("Add to watchlist", key=f"card_add_wl_{ticker}"):
-            card_wl_result = _add_ticker_to_watchlist(ticker, pick_wl_card)
-            if card_wl_result == "added":
-                st.success(f"Added {ticker} to watchlist '{pick_wl_card}'.")
-            elif card_wl_result == "already":
-                st.warning(f"{ticker} is already in watchlist '{pick_wl_card}'.")
-            else:
-                st.warning("Couldn't write user_data.json — changes won't persist after a restart.")
+    _card_add_controls(ticker)
 
     # Price vs Sticker chart — lazy, so a lookup doesn't pay for a
     # Yahoo history call it didn't ask for. Monthly closes (16 years is
@@ -1440,13 +1463,19 @@ with tab_dashboard:
                         continue
                     if _snap.get("price_date"):
                         _dash_price_dates.append(_snap["price_date"])
-                    _val = valuation_from_snapshot(_snap, discount_rate, max_growth)
-                    _sig = portfolio_signal(
-                        _snap, _val, _h.get("avg_cost"), _approach, _min_moat_hold, _max_loss,
-                        _min_moat_buy_pf, _near_buy_pf,
-                    )
-                    _pf_counts[_sig["signal"]] += 1
-                    _pf_sig_counts[_sig["signal"]] += 1
+                    if _snap.get("is_fund"):
+                        # Funds count toward value and dividend income but
+                        # never toward signals, the cut watch, or attention.
+                        _val = None
+                        _sig = {"signal": "FUND", "reasons": []}
+                    else:
+                        _val = valuation_from_snapshot(_snap, discount_rate, max_growth)
+                        _sig = portfolio_signal(
+                            _snap, _val, _h.get("avg_cost"), _approach, _min_moat_hold, _max_loss,
+                            _min_moat_buy_pf, _near_buy_pf,
+                        )
+                        _pf_counts[_sig["signal"]] += 1
+                        _pf_sig_counts[_sig["signal"]] += 1
                     _price = _snap["current_price"]
                     _value = _price * _h["shares"] if _h.get("shares") else None
                     if _value is not None:
@@ -1469,8 +1498,9 @@ with tab_dashboard:
                     # The payout jump compares against the stored baseline;
                     # the snapshot's own payout is used, not a manual
                     # override — a user editing manual data is not a
-                    # company action.
-                    _cut_flag = _dividend_payment_cut(_snap.get("dividend_payments"))
+                    # company action. Funds skip the watch: their payouts
+                    # vary by design, so a lower distribution is not a cut.
+                    _cut_flag = None if _snap.get("is_fund") else _dividend_payment_cut(_snap.get("dividend_payments"))
                     _payout_raw = _snap.get("payout_ratio")
                     _prev_pay = (_dash_watch.get(_h["ticker"]) or {}).get("payout")
                     _pay_flag = _payout_jump_check(_payout_raw, _prev_pay)
@@ -1485,7 +1515,7 @@ with tab_dashboard:
                         })
                     _new_watch = {"payout": _payout_raw, "date": datetime.now().strftime("%Y-%m-%d")}
                     _prev_watch = _dash_watch.get(_h["ticker"])
-                    if _prev_watch is None or _prev_watch.get("payout") != _new_watch["payout"]:
+                    if not _snap.get("is_fund") and (_prev_watch is None or _prev_watch.get("payout") != _new_watch["payout"]):
                         _dash_watch[_h["ticker"]] = _new_watch
                         _dash_watch_changed = True
                     # Income attribution: compare this holding against its
@@ -1531,6 +1561,11 @@ with tab_dashboard:
                     _snap = build_snapshot(_t, price_max_age=TRACKING_PRICE_MAX_AGE)
                     if _snap.get("error"):
                         _wl_counts["NO DATA"] += 1
+                        continue
+                    if _snap.get("is_fund"):
+                        if _snap.get("price_date"):
+                            _dash_price_dates.append(_snap["price_date"])
+                        _wl_counts["FUND"] += 1
                         continue
                     if _snap.get("price_date"):
                         _dash_price_dates.append(_snap["price_date"])
@@ -1892,6 +1927,62 @@ with tab_portfolio:
                                  "Signal": "NO DATA", "Lean": "\u2014", "Why": _short_why(snap["error"]), "_rank": 9, "_value": 0.0, "_moat": 0.0})
                     review_items.append({"Ticker": h["ticker"], "Signal": "NO DATA", "Lean": "\u2014", "Reason": snap["error"], "_urgency": 0})
                     continue
+                if snap.get("is_fund"):
+                    # Funds: price, value, gain/loss, and dividend income
+                    # from Yahoo — no Sticker, Moat, or signal, and no
+                    # signal-log entry. _moat is None (not 0) so the
+                    # weighted Moat below counts stocks only.
+                    if snap.get("price_date"):
+                        portfolio_price_dates.append(snap["price_date"])
+                    price_f = snap["current_price"]
+                    value_f = price_f * h["shares"] if h["shares"] else None
+                    gain_f = (price_f - h["avg_cost"]) * h["shares"] if (h["shares"] and h["avg_cost"]) else None
+                    gain_pct_f = (price_f / h["avg_cost"] - 1) * 100 if h["avg_cost"] else None
+                    if value_f is not None:
+                        total_value += value_f
+                    if h["shares"] and h["avg_cost"]:
+                        total_cost += h["shares"] * h["avg_cost"]
+                    manual_f = _manual_for(h["ticker"])
+                    dps_f = manual_f.get("dividend_per_share") if "dividend_per_share" in manual_f else snap.get("dividend_per_share")
+                    dps_label_f = " ✏️" if "dividend_per_share" in manual_f else ""
+                    div_income_f = h["shares"] * dps_f if (h["shares"] and dps_f) else None
+                    if div_income_f is not None:
+                        total_div_income += div_income_f
+                    yoc_f = (dps_f / h["avg_cost"]) if (dps_f and h["avg_cost"]) else None
+                    if div_income_f is not None:
+                        projection_excluded.append(h["ticker"])
+                    full_why_items.append({
+                        "Ticker": h["ticker"], "Signal": "FUND", "Lean": "—",
+                        "Why": "Fund — no Sticker or signal; price and distributions from Yahoo.",
+                    })
+                    tax_info_f = _tax_term(h.get("purchase_date"))
+                    est_tax_f = _estimated_tax(gain_f, tax_info_f["term"], tax_rates) if is_taxable_pf else None
+                    rows.append({
+                        "Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": money(h["avg_cost"]), "Price": money(price_f),
+                        "Value": money(value_f), "Gain/Loss": money(gain_f),
+                        "Gain %": "—" if gain_pct_f is None else f"{gain_pct_f:+.1f}%",
+                        "Sticker": "—", "Moat": "—",
+                        "Meaning": "Fund", "Moat type": "—",
+                        "Weight": "—", "Target %": "—" if h.get("target_pct") is None else f"{h['target_pct']:.1f}%", "Drift": "—",
+                        "Div Income/yr": money(div_income_f) + dps_label_f if div_income_f is not None else "—",
+                        "% of Div Income": "—",
+                        "Yield on Cost": "—" if yoc_f is None else f"{yoc_f:.1%}",
+                        "Flags": "—",
+                        "Mkt Cap": "—", "PEG": "—",
+                        "Owner Yield": "—",
+                        "Data": "—",
+                        "Last FY End": "—",
+                        "Tax Term": tax_info_f["term"],
+                        "Days to LT": "—" if tax_info_f["days_to_lt"] is None else str(tax_info_f["days_to_lt"]),
+                        "Est Tax": "—" if est_tax_f is None else money(est_tax_f),
+                        "Signal": "FUND", "Lean": "—", "Why": "Fund — no Sticker or signal",
+                        "_rank": 9,
+                        "_value": value_f or 0.0, "_moat": None, "_target": h.get("target_pct"),
+                        "_ticker_for_log": None, "_price_for_log": None, "_sticker_for_log": None,
+                        "_gain": gain_f, "_term": tax_info_f["term"], "_shares": h["shares"], "_avg_cost": h["avg_cost"],
+                        "_div_income": div_income_f or 0.0,
+                    })
+                    continue
                 val = valuation_from_snapshot(snap, discount_rate, max_growth)
                 if snap.get("price_date"):
                     portfolio_price_dates.append(snap["price_date"])
@@ -2037,7 +2128,9 @@ with tab_portfolio:
         for r in rows:
             if total_div_income > 0 and r.get("_div_income"):
                 r["% of Div Income"] = f"{r['_div_income'] / total_div_income:.1%}"
-        weighted_moat = (sum(r["_value"] * r["_moat"] for r in rows) / total_value) if total_value > 0 else None
+        _moat_rows = [r for r in rows if r.get("_moat") is not None]
+        _moat_value = sum(r["_value"] for r in _moat_rows)
+        weighted_moat = (sum(r["_value"] * r["_moat"] for r in _moat_rows) / _moat_value) if _moat_value > 0 else None
         largest = max(rows, key=lambda r: r["_value"]) if rows else None
         rows.sort(key=lambda r: r["_rank"])
         # Signal log: one entry per ticker per day (today's entry is
@@ -2088,7 +2181,7 @@ with tab_portfolio:
                 + " \u00b7 holdings with no DPS show \u2014, not $0, so this total may understate income."
             )
         if weighted_moat is not None:
-            st.markdown(f"**Weighted Moat Score:** {weighted_moat:.1f} / 100 (by position value)")
+            st.markdown(f"**Weighted Moat Score:** {weighted_moat:.1f} / 100 (by stock position value — funds have no Moat)")
         if largest is not None and total_account > 0 and largest["_value"]:
             st.markdown(f"**Largest holding:** {largest['Ticker']} at {largest['_value'] / total_account:.1%} of account value")
         # Dividend income projection, if growth continues at the 5-year
@@ -2375,9 +2468,25 @@ with tab_watchlist:
             for t in watch:
                 snap = build_snapshot(t, price_max_age=TRACKING_PRICE_MAX_AGE)
                 if snap.get("error"):
-                    rows.append({"Ticker": t, "Price": "\u2014", "Sticker": "\u2014", "Buy Below": "\u2014", "% Above Buy Price": "\u2014",
+                    rows.append({"Ticker": t, "Price": "\u2014", "Yield": "\u2014", "Sticker": "\u2014", "Buy Below": "\u2014", "% Above Buy Price": "\u2014",
                                  "Moat": "\u2014", "Mkt Cap": "\u2014", "PEG": "\u2014", "Owner Yield": "\u2014", "Data": "\u2014", "Flags": "\u2014",
                                  "Signal": "NO DATA", "Why": _short_why(snap["error"]), "_rank": 9, "_pct": 1e9})
+                    continue
+                if snap.get("is_fund"):
+                    # Funds: price and TTM yield from Yahoo — no Sticker,
+                    # Moat, or signal.
+                    if snap.get("price_date"):
+                        watch_price_dates.append(snap["price_date"])
+                    _fy_w = snap.get("dividend_yield")
+                    watch_full_why.append({"Ticker": t, "Signal": "FUND", "Why": "Fund — no Sticker or signal; price and distributions from Yahoo."})
+                    rows.append({
+                        "Ticker": t, "Price": money(snap["current_price"]),
+                        "Yield": "—" if _fy_w is None else f"{_fy_w:.1%}",
+                        "Sticker": "—", "Buy Below": "—", "% Above Buy Price": "—",
+                        "Moat": "—", "Mkt Cap": "—", "PEG": "—", "Owner Yield": "—", "Data": "—", "Flags": "—",
+                        "Signal": "FUND", "Why": "Fund — no Sticker or signal",
+                        "_rank": 9, "_pct": 1e9,
+                    })
                     continue
                 val = valuation_from_snapshot(snap, discount_rate, max_growth)
                 sig = buy_signal(snap, val, float(min_moat_buy), float(near_buy_pct))
@@ -2390,7 +2499,9 @@ with tab_watchlist:
                     watch_price_dates.append(snap["price_date"])
                 watch_full_why.append({"Ticker": t, "Signal": sig["signal"], "Why": "; ".join(sig["reasons"])})
                 rows.append({
-                    "Ticker": t, "Price": money(snap["current_price"]), "Sticker": money(val["sticker_price"]),
+                    "Ticker": t, "Price": money(snap["current_price"]),
+                    "Yield": "—" if snap.get("dividend_yield") is None else f"{snap['dividend_yield']:.1%}",
+                    "Sticker": money(val["sticker_price"]),
                     "Buy Below": money(val["margin_of_safety_price"]),
                     "% Above Buy Price": "\u2014" if pct is None else f"{pct:+.1f}%",
                     "Moat": snap["moat_score"],

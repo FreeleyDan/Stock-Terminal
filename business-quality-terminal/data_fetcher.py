@@ -765,13 +765,55 @@ def _dividends_from_history(hist: Any) -> List[Tuple[str, float]]:
     return out[-12:]
 
 
+def _ttm_dividends(payments: List[Tuple[str, float]]) -> Optional[float]:
+    """Trailing-12-month dividends per share from [(date, $/share)].
+    The payment frequency is read from the median gap between recent
+    payments (monthly -> last 12, quarterly -> last 4, semiannual ->
+    last 2, annual -> last 1); when the frequency can't be established
+    the sum of payments in the 365 days up to the latest payment is
+    used. A plain 365-day window would catch five quarterly payments
+    whenever the year-ago distribution lands on the boundary, so the
+    count is set by frequency, not by the window. None when there are
+    no payments."""
+    if not payments:
+        return None
+    _parsed: List[Tuple[Any, float]] = []
+    for d, v in payments:
+        try:
+            _parsed.append((date.fromisoformat(d), v))
+        except ValueError:
+            continue
+    if not _parsed:
+        return None
+    _parsed.sort()
+    if len(_parsed) >= 3:
+        _gaps = sorted((_parsed[i + 1][0] - _parsed[i][0]).days for i in range(len(_parsed) - 1))
+        _med = _gaps[len(_gaps) // 2]
+        _n: Optional[int] = None
+        if 20 <= _med <= 40:
+            _n = 12
+        elif 75 <= _med <= 110:
+            _n = 4
+        elif 150 <= _med <= 200:
+            _n = 2
+        elif 300 <= _med <= 400:
+            _n = 1
+        if _n is not None:
+            return sum(v for _d, v in _parsed[-_n:])
+    latest = _parsed[-1][0]
+    cutoff = latest - timedelta(days=365)
+    total = sum(v for d, v in _parsed if d > cutoff)
+    return total if total > 0 else None
+
+
 def get_price_history(ticker: str) -> Tuple[Optional[Dict[str, Any]], str]:
     """
     One yfinance call -> daily (split-adjusted, NOT dividend-adjusted)
     closes + the stock-split history. Returns (bundle, status) with status
     "ok", "empty" (Yahoo has no data -- delisted/unknown) or "error".
     bundle = {"closes": {date: close}, "splits": [(date, ratio)],
-              "last_close": float, "last_date": str}
+              "last_close": float, "last_date": str,
+              "dividends": [(date, $/share)], "ttm_dividends": float|None}
     """
     try:
         import yfinance as yf
@@ -799,6 +841,7 @@ def get_price_history(ticker: str) -> Tuple[Optional[Dict[str, Any]], str]:
         last_date = max(closes)
         return (
             {"closes": closes, "splits": splits, "dividends": dividends,
+             "ttm_dividends": _ttm_dividends(dividends),
              "last_close": closes[last_date], "last_date": last_date},
             "ok",
         )

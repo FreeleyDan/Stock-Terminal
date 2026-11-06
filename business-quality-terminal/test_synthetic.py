@@ -20,8 +20,9 @@ from calculations import (
     calculate_owner_earnings,
     calculate_sticker_price,
 )
-from data_fetcher import _build_financial_history, _dividends_from_history, _ttm_from_series
+from data_fetcher import _build_financial_history, _dividends_from_history, _ttm_dividends, _ttm_from_series
 from gatekeeper import evaluate_business_quality
+from valuation import _evaluate, valuation_from_snapshot
 
 
 def _duration_fact(start, end, val, form="10-K", filed="2024-11-01", fy=2024, fp="FY", accn="0001"):
@@ -220,6 +221,57 @@ def main():
         errors.append(f"FAIL: missing year-ago quarter must fall back to annual: {(_v, _a, _u)}")
     if _ttm_from_series({}, {"2024-12-31": 1.6}) != (None, None, False):
         errors.append("FAIL: no annual data -> no TTM")
+
+    # Trailing-12-month dividends: the count comes from the payment
+    # frequency (quarterly -> last 4, monthly -> last 12), not a raw
+    # 365-day window, which would catch a fifth quarterly payment
+    # whenever the year-ago distribution lands on the boundary.
+    _q_pays = [
+        ("2024-03-15", 0.50), ("2024-06-15", 0.55), ("2024-09-15", 0.55),
+        ("2024-12-15", 0.60), ("2025-03-15", 0.62), ("2025-06-15", 0.62),
+        ("2025-09-15", 0.65), ("2025-12-15", 0.65),
+    ]
+    if abs((_ttm_dividends(_q_pays) or 0) - 2.54) > 1e-9:
+        errors.append(f"FAIL: TTM dividends (quarterly) got {_ttm_dividends(_q_pays)}, expected 2.54")
+    _m_pays = [("2024-12-15", 0.10)] + [(f"2025-{m:02d}-15", 0.10) for m in range(1, 13)]
+    if abs((_ttm_dividends(_m_pays) or 0) - 1.20) > 1e-9:
+        errors.append(f"FAIL: TTM dividends (monthly) got {_ttm_dividends(_m_pays)}, expected 1.20")
+    if _ttm_dividends([]) is not None:
+        errors.append("FAIL: no payments -> no TTM dividends")
+    if _ttm_dividends([("2025-06-15", 0.42)]) != 0.42:
+        errors.append("FAIL: single payment -> that payment")
+
+    # Fund snapshot: SEC has no 10-K (not_covered) -> Yahoo-only snapshot
+    # with price and TTM distributions, no Sticker/Moat. Stubbed Yahoo.
+    import valuation as _val_mod
+    _real_facts = _val_mod.fetch_raw_companyfacts
+    _real_prices = _val_mod.get_price_history
+    try:
+        _val_mod.fetch_raw_companyfacts = lambda t: (None, "not_covered")
+        _val_mod.get_price_history = lambda t: (
+            {"closes": {"2026-11-05": 82.50}, "splits": [],
+             "dividends": _q_pays, "ttm_dividends": 2.54,
+             "last_close": 82.50, "last_date": "2026-11-05"}, "ok")
+        _fund, _where = _evaluate("SCHD", prune_unvaluable=False)
+        if _fund.get("error") or not _fund.get("is_fund"):
+            errors.append(f"FAIL: fund snapshot got { _fund.get('error')}")
+        if _fund.get("current_price") != 82.50 or abs((_fund.get("dividend_per_share") or 0) - 2.54) > 1e-9:
+            errors.append(f"FAIL: fund price/DPS got {_fund.get('current_price')}/{_fund.get('dividend_per_share')}")
+        if abs((_fund.get("dividend_yield") or 0) - 2.54 / 82.50) > 1e-9:
+            errors.append(f"FAIL: fund yield got {_fund.get('dividend_yield')}")
+        # Scan mode keeps the old error and makes no Yahoo call.
+        _val_mod.get_price_history = lambda t: (_ for _ in ()).throw(AssertionError("Yahoo must not be called in prune mode"))
+        _pruned, _where2 = _evaluate("SCHD", prune_unvaluable=True)
+        if not _pruned.get("error") or "No SEC filings" not in _pruned["error"]:
+            errors.append(f"FAIL: prune mode fund handling got {_pruned}")
+    finally:
+        _val_mod.fetch_raw_companyfacts = _real_facts
+        _val_mod.get_price_history = _real_prices
+    _fund_val = valuation_from_snapshot({"is_fund": True, "current_price": 82.50})
+    if _fund_val.get("sticker_price") is not None or _fund_val.get("action") is not None:
+        errors.append(f"FAIL: fund valuation must have no Sticker/action: {_fund_val}")
+    if "Fund" not in (_fund_val.get("note") or ""):
+        errors.append(f"FAIL: fund valuation note got {_fund_val.get('note')}")
 
     print(f"Moat Score: {gatekeeper_result['moat_score']} / 100")
     if errors:

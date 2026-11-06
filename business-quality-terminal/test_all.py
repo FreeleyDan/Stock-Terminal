@@ -215,10 +215,15 @@ check("price refresh failure keeps the older price instead of erroring",
 # permanent vs transient
 state["raw"] = (None, "not_covered")
 s = valuation.build_snapshot("NOCOV")
-check("not covered by EDGAR -> permanent error", (bool(s["error"]), s["error_kind"]), (True, "permanent"))
+check("not covered by EDGAR + Yahoo data -> fund snapshot, not an error",
+      (bool(s["error"]), s.get("is_fund"), s["current_price"]), (False, True, 100.0))
 n = state["raw_calls"]
 valuation.build_snapshot("NOCOV")
-check("permanent errors are cached (no refetch)", state["raw_calls"], n)
+check("fund snapshots are cached (no refetch)", state["raw_calls"], n)
+state["price"] = (None, "empty")
+s = valuation.build_snapshot("NOCOV2")
+check("not covered by EDGAR + no Yahoo data -> permanent error", (bool(s["error"]), s["error_kind"]), (True, "permanent"))
+state["price"] = (PRICE_BUNDLE, "ok")
 
 state["raw"] = (None, "transient")
 s = valuation.build_snapshot("FLAKY")
