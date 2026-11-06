@@ -20,7 +20,7 @@ from calculations import (
     calculate_owner_earnings,
     calculate_sticker_price,
 )
-from data_fetcher import _build_financial_history, _dividends_from_history
+from data_fetcher import _build_financial_history, _dividends_from_history, _ttm_from_series
 from gatekeeper import evaluate_business_quality
 
 
@@ -106,6 +106,19 @@ def build_mock_companyfacts():
         _duration_fact("2024-01-01", "2024-06-30", 500_000_000, form="10-Q", filed="2024-08-01", accn="0000-10q")
     )
 
+    # --- 10-Q entries for the TTM test: Q1 FY2025 and the same quarter
+    # a year earlier. TTM EPS = 6.00 + 1.60 − 1.40 = 6.20.
+    eps_entries.append(_duration_fact("2024-10-01", "2024-12-31", 1.60, form="10-Q", filed="2025-02-01", fy=2025, fp="Q1", accn="0000-q1-25"))
+    eps_entries.append(_duration_fact("2023-10-01", "2023-12-31", 1.40, form="10-Q", filed="2024-02-01", fy=2024, fp="Q1", accn="0000-q1-24"))
+    net_income_entries.append(_duration_fact("2024-10-01", "2024-12-31", 266_666_667, form="10-Q", filed="2025-02-01", fy=2025, fp="Q1", accn="0000-q1-25"))
+    net_income_entries.append(_duration_fact("2023-10-01", "2023-12-31", 233_333_333, form="10-Q", filed="2024-02-01", fy=2024, fp="Q1", accn="0000-q1-24"))
+    op_cash_flow_entries.append(_duration_fact("2024-10-01", "2024-12-31", 400_000_000, form="10-Q", filed="2025-02-01", fy=2025, fp="Q1", accn="0000-q1-25"))
+    op_cash_flow_entries.append(_duration_fact("2023-10-01", "2023-12-31", 350_000_000, form="10-Q", filed="2024-02-01", fy=2024, fp="Q1", accn="0000-q1-24"))
+    cap_ex_entries.append(_duration_fact("2024-10-01", "2024-12-31", 80_000_000, form="10-Q", filed="2025-02-01", fy=2025, fp="Q1", accn="0000-q1-25"))
+    cap_ex_entries.append(_duration_fact("2023-10-01", "2023-12-31", 70_000_000, form="10-Q", filed="2024-02-01", fy=2024, fp="Q1", accn="0000-q1-24"))
+    dep_amort_entries.append(_duration_fact("2024-10-01", "2024-12-31", 55_000_000, form="10-Q", filed="2025-02-01", fy=2025, fp="Q1", accn="0000-q1-25"))
+    dep_amort_entries.append(_duration_fact("2023-10-01", "2023-12-31", 50_000_000, form="10-Q", filed="2024-02-01", fy=2024, fp="Q1", accn="0000-q1-24"))
+
     equity_entries = [
         _instant_fact(end_date, money_val(4_000_000_000, years_ago), filed=f"{end_date[:4]}-11-15")
         for years_ago, end_date in fy_ends.items()
@@ -175,6 +188,38 @@ def main():
         errors.append(f"FAIL: dividends extraction got {got_divs}")
     if _dividends_from_history(pd.DataFrame({"Close": [1.0]})) != []:
         errors.append("FAIL: no Dividends column -> empty list")
+
+    # Trailing-12-month values from the 10-Q entries: annual + latest Q
+    # − same Q last year. EPS 6.00 + 1.60 − 1.40 = 6.20.
+    ttm = financial_history.get("_ttm") or {}
+    if ttm.get("eps") is None or abs(ttm["eps"] - 6.20) > 1e-9:
+        errors.append(f"FAIL: TTM EPS got {ttm.get('eps')}, expected 6.20")
+    if ttm.get("used") is not True or ttm.get("as_of") != "2024-12-31":
+        errors.append(f"FAIL: TTM flag/as_of got used={ttm.get('used')} as_of={ttm.get('as_of')}")
+    if ttm.get("annual_eps") != 6.0:
+        errors.append(f"FAIL: annual EPS got {ttm.get('annual_eps')}")
+    if abs((ttm.get("owner_earnings") or 0) - 928_333_334) > 1:
+        errors.append(f"FAIL: TTM owner earnings got {ttm.get('owner_earnings')}")
+    if abs((ttm.get("free_cash_flow") or 0) - 1_240_000_000) > 1:
+        errors.append(f"FAIL: TTM FCF got {ttm.get('free_cash_flow')}")
+    if financial_history.get("_last_fy_end") != "2024-09-30":
+        errors.append(f"FAIL: last FY end got {financial_history.get('_last_fy_end')}")
+    # Annual horizons must be unchanged by the 10-Q entries.
+    if financial_history["EPS"].get(0) != 6.0:
+        errors.append(f"FAIL: annual EPS changed by 10-Q entries: {financial_history['EPS'].get(0)}")
+
+    # _ttm_from_series edge cases (direct).
+    _v, _a, _u = _ttm_from_series({"2024-09-30": 6.0}, {"2024-12-31": 1.6, "2023-12-31": 1.4})
+    if abs(_v - 6.2) > 1e-9 or _a != "2024-12-31" or _u is not True:
+        errors.append(f"FAIL: _ttm_from_series basic got {(_v, _a, _u)}")
+    _v, _a, _u = _ttm_from_series({"2024-09-30": 6.0}, {"2024-06-30": 1.5, "2023-06-30": 1.3})
+    if _v != 6.0 or _u is not False:
+        errors.append(f"FAIL: quarter before year-end must fall back to annual: {(_v, _a, _u)}")
+    _v, _a, _u = _ttm_from_series({"2024-09-30": 6.0}, {"2024-12-31": 1.6})
+    if _v != 6.0 or _u is not False:
+        errors.append(f"FAIL: missing year-ago quarter must fall back to annual: {(_v, _a, _u)}")
+    if _ttm_from_series({}, {"2024-12-31": 1.6}) != (None, None, False):
+        errors.append("FAIL: no annual data -> no TTM")
 
     print(f"Moat Score: {gatekeeper_result['moat_score']} / 100")
     if errors:

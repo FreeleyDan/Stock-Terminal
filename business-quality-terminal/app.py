@@ -463,6 +463,22 @@ def _display_purchase_date(value: Any) -> str:
     return _d.strftime("%m-%d-%Y") if _d else ""
 
 
+def _ttm_caption(snap: Dict[str, Any]) -> Optional[str]:
+    """One-line note when the Sticker uses trailing-12-month inputs."""
+    if not snap.get("ttm_used"):
+        return None
+    _eps = snap.get("current_eps")
+    _ann = snap.get("annual_eps")
+    _asof = _display_purchase_date(snap.get("ttm_as_of"))
+    _eps_txt = money(_eps) if _eps is not None else "—"
+    _ann_txt = f" (annual EPS was {money(_ann)})" if _ann is not None else ""
+    return (
+        f"Sticker uses trailing-12-month EPS {_eps_txt}"
+        + (f" through {_asof}" if _asof else "")
+        + f"{_ann_txt}. Big Five, growth, and P/E still use annual 10-K history."
+    )
+
+
 def _tax_term(purchase_date_str: Optional[str], sale: Optional[date] = None) -> Dict[str, Any]:
     """Long-term vs short-term for a sale date (default today).
     Long-term means held MORE than one year: the first long-term-
@@ -1014,7 +1030,12 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
         details.append(f"Owner earnings yield {oey_card:.1%} (owner earnings ÷ market cap)")
     if snap.get("dividend_streak"):
         details.append(f"dividend raised {snap['dividend_streak']} yrs in a row")
+    if snap.get("last_fy_end"):
+        details.append(f"Last FY end {_display_purchase_date(snap.get('last_fy_end'))}")
     st.caption(" \u00b7 ".join(details))
+    _ttm_note = _ttm_caption(snap)
+    if _ttm_note:
+        st.caption(_ttm_note)
     if val["note"]:
         st.caption(val["note"])
     st.dataframe(build_checklist_dataframe(snap["gatekeeper"]), hide_index=True, use_container_width=True)
@@ -1329,6 +1350,52 @@ with tab_dashboard:
         "without opening each tab."
     )
     _dash_data = load_user_data()
+    if st.session_state.get("price_refresh_msg"):
+        st.success(st.session_state.pop("price_refresh_msg"))
+    _dash_btn1, _dash_btn2 = st.columns(2)
+    with _dash_btn1:
+        if st.button("Refresh all prices", key="dash_refresh_prices"):
+            # Fresh Yahoo prices for every portfolio holding and watchlist
+            # ticker, without re-fetching SEC fundamentals (cached 24h).
+            _tickers: set = set()
+            for _pf in (_dash_data.get("portfolios") or {}).values():
+                for _h in _pf or []:
+                    if isinstance(_h, dict) and _h.get("ticker"):
+                        _tickers.add(normalize_ticker(_h["ticker"]))
+            for _wl in (_dash_data.get("watchlists") or {}).values():
+                for _t in _wl or []:
+                    _tickers.add(normalize_ticker(_t))
+            _refreshed = _unchanged = 0
+            for _t in sorted(_tickers):
+                try:
+                    _before = build_snapshot(_t)
+                    _after = build_snapshot(_t, price_max_age=0)
+                except Exception:
+                    continue
+                if _before.get("error") or _after.get("error"):
+                    continue
+                if (_after.get("price_date") != _before.get("price_date")
+                        or _after.get("current_price") != _before.get("current_price")):
+                    _refreshed += 1
+                else:
+                    _unchanged += 1
+            st.session_state["price_refresh_msg"] = (
+                f"Refreshed {_refreshed} prices, {_unchanged} unchanged (Yahoo had nothing newer)."
+            )
+            st.rerun()
+    with _dash_btn2:
+        st.download_button(
+            "Download full backup (JSON)",
+            data=json.dumps(_dash_data, indent=2),
+            file_name=f"stock-terminal-backup-{datetime.now().strftime('%Y-%m-%d')}.json",
+            mime="application/json",
+            key="dash_backup",
+        )
+    st.caption(
+        "Backup holds everything — portfolios, watchlists, manual data, goal history, tax settings, sales log, "
+        "presets. On Streamlit Cloud the saved file can be wiped on sleep/restart; this download is your copy. "
+        "Prices already refresh on their own when older than 15 minutes — the button forces fresh prices now."
+    )
     _dash_portfolios = _dash_data.get("portfolios") or {}
     _dash_watchlists = _dash_data.get("watchlists") or {}
     _dash_cash = _dash_data.get("portfolio_cash") or {}
@@ -1821,7 +1888,7 @@ with tab_portfolio:
                                  "Div Income/yr": "\u2014",
                                  "% of Div Income": "\u2014",
                                  "Yield on Cost": "\u2014", "Flags": "\u2014", "Mkt Cap": "\u2014", "PEG": "\u2014",
-                                 "Owner Yield": "\u2014", "Data": "\u2014", "Tax Term": "\u2014", "Days to LT": "\u2014", "Est Tax": "\u2014",
+                                 "Owner Yield": "\u2014", "Data": "\u2014", "Last FY End": "\u2014", "Tax Term": "\u2014", "Days to LT": "\u2014", "Est Tax": "\u2014",
                                  "Signal": "NO DATA", "Lean": "\u2014", "Why": _short_why(snap["error"]), "_rank": 9, "_value": 0.0, "_moat": 0.0})
                     review_items.append({"Ticker": h["ticker"], "Signal": "NO DATA", "Lean": "\u2014", "Reason": snap["error"], "_urgency": 0})
                     continue
@@ -1948,6 +2015,7 @@ with tab_portfolio:
                     "PEG": "\u2014" if peg_pf is None else f"{peg_pf:.2f}",
                     "Owner Yield": "\u2014" if oey_pf is None else f"{oey_pf:.1%}",
                     "Data": f"{comp_pf['metrics']}/5" + (" ⚠️" if comp_pf["metrics"] <= 3 else ""),
+                    "Last FY End": _display_purchase_date(snap.get("last_fy_end")),
                     "Tax Term": tax_info_pf["term"],
                     "Days to LT": "\u2014" if tax_info_pf["days_to_lt"] is None else str(tax_info_pf["days_to_lt"]),
                     "Est Tax": "\u2014" if est_tax_pf is None else money(est_tax_pf),

@@ -13,7 +13,9 @@ EDGAR pitfalls handled on purpose:
   - XBRL facts live under different unit keys ("USD", "USD/shares",
     "shares") -- mapped per field, never just "USD".
   - Tags can live under different taxonomy namespaces (us-gaap, dei, ...).
-  - Only 10-K / 10-K/A facts; duration facts only ~300-400 day spans.
+  - Only 10-K / 10-K/A facts for annual history; duration facts only
+    ~300-400 day spans. 10-Q / 10-Q/A facts (~50-140 day spans) feed
+    trailing-12-month values only — the Sticker base, never the Big Five.
   - Restatements: the most recently *filed* value for a period wins.
   - Fiscal year-ends are matched to years_ago (0/1/3/5/10) by nearest date
     within a tolerance window, not by column position.
@@ -64,6 +66,13 @@ COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.jso
 VALID_FORMS = {"10-K", "10-K/A"}
 DURATION_MIN_DAYS = 300
 DURATION_MAX_DAYS = 400
+
+# Quarterly facts (10-Q / 10-Q/A) are used ONLY for trailing-12-month
+# values — the Sticker base. A quarter is ~90 days; the wide window
+# tolerates 13-week quarters and odd short periods after a year-end change.
+QUARTERLY_FORMS = {"10-Q", "10-Q/A"}
+QUARTER_DURATION_MIN_DAYS = 50
+QUARTER_DURATION_MAX_DAYS = 140
 
 TARGET_HORIZONS = [0, 1, 3, 5, 10]
 # Flat window (not scaled by horizon): fiscal year-ends are defined by a
@@ -330,18 +339,20 @@ def _iter_taxonomy_facts(raw_companyfacts: Dict[str, Any], tag: str):
 
 
 def _extract_tag_series_full(
-    raw_companyfacts: Dict[str, Any], tag: str, expected_unit: str, is_duration: bool
+    raw_companyfacts: Dict[str, Any], tag: str, expected_unit: str, is_duration: bool,
+    forms: Optional[set] = None, dur_min: int = DURATION_MIN_DAYS, dur_max: int = DURATION_MAX_DAYS,
 ) -> Dict[str, Tuple[float, str]]:
     """{period_end: (value, filed_date)} after every filter in the module
     docstring (unit key, namespaces, 10-K forms, annual duration, latest
-    filing wins)."""
+    filing wins). Pass quarterly forms/duration for 10-Q facts."""
+    _forms = forms if forms is not None else VALID_FORMS
     best: Dict[str, Dict[str, Any]] = {}
     for _taxonomy, fact_entry in _iter_taxonomy_facts(raw_companyfacts, tag):
         entries = fact_entry.get("units", {}).get(expected_unit)
         if not entries:
             continue
         for item in entries:
-            if item.get("form", "") not in VALID_FORMS:
+            if item.get("form", "") not in _forms:
                 continue
             end_date = item.get("end")
             if not end_date:
@@ -351,7 +362,7 @@ def _extract_tag_series_full(
                 if not start_date:
                     continue
                 span = _days_between(start_date, end_date)
-                if span is None or not (DURATION_MIN_DAYS <= span <= DURATION_MAX_DAYS):
+                if span is None or not (dur_min <= span <= dur_max):
                     continue
             filed = item.get("filed", "")
             existing = best.get(end_date)
@@ -384,9 +395,11 @@ def _get_best_tag_series_with_tag(
     raw_companyfacts: Dict[str, Any],
     metric_key: str,
     splits: Optional[List[Tuple[str, float]]] = None,
+    quarterly: bool = False,
 ) -> Tuple[Dict[str, float], Optional[str]]:
     """Best-tag series, split-adjusted where the metric is per-share or
-    a share count. Returns (series, primary_tag).
+    a share count. Returns (series, primary_tag). With quarterly=True
+    the series is built from 10-Q facts instead of 10-K facts.
 
     BUG FIX (2026-11-04): the old version returned the FIRST candidate
     tag with any data. That silently truncated history when the first
@@ -402,10 +415,13 @@ def _get_best_tag_series_with_tag(
     """
     expected_unit = METRIC_UNIT[metric_key]
     is_duration = metric_key in DURATION_METRICS
+    _forms = QUARTERLY_FORMS if quarterly else VALID_FORMS
+    _dur_min = QUARTER_DURATION_MIN_DAYS if quarterly else DURATION_MIN_DAYS
+    _dur_max = QUARTER_DURATION_MAX_DAYS if quarterly else DURATION_MAX_DAYS
 
     per_tag: List[Tuple[str, Dict[str, float]]] = []
     for tag in TAG_CANDIDATES[metric_key]:
-        full = _extract_tag_series_full(raw_companyfacts, tag, expected_unit, is_duration)
+        full = _extract_tag_series_full(raw_companyfacts, tag, expected_unit, is_duration, _forms, _dur_min, _dur_max)
         if not full:
             continue
         series: Dict[str, float] = {}
@@ -435,10 +451,50 @@ def _get_best_tag_series(
     raw_companyfacts: Dict[str, Any],
     metric_key: str,
     splits: Optional[List[Tuple[str, float]]] = None,
+    quarterly: bool = False,
 ) -> Dict[str, float]:
     """Best-tag series (see _get_best_tag_series_with_tag)."""
-    series, _tag = _get_best_tag_series_with_tag(raw_companyfacts, metric_key, splits)
+    series, _tag = _get_best_tag_series_with_tag(raw_companyfacts, metric_key, splits, quarterly)
     return series
+
+
+def _ttm_from_series(
+    annual_by_date: Dict[str, float], quarterly_by_date: Dict[str, float]
+) -> Tuple[Optional[float], Optional[str], bool]:
+    """Trailing-12-month value from an annual {end: value} series and a
+    quarterly {end: value} series. Returns (value, as_of_end, used_ttm).
+    TTM = latest annual + latest quarter − same quarter a year earlier
+    (end date within 45 days of latest-quarter-minus-365-days). When the
+    latest quarter is not past the latest annual year-end — the 10-K was
+    just filed — TTM is just the annual value (used_ttm False). None when
+    the year-ago quarter is missing, so a partial TTM never ships."""
+    if not annual_by_date:
+        return None, None, False
+    _a_end = max(annual_by_date)
+    _a_val = annual_by_date[_a_end]
+    if not quarterly_by_date:
+        return _a_val, _a_end, False
+    _q_end = max(quarterly_by_date)
+    if _q_end <= _a_end:
+        return _a_val, _a_end, False
+    try:
+        _q_end_d = date.fromisoformat(_q_end)
+    except ValueError:
+        return _a_val, _a_end, False
+    _target = _q_end_d - timedelta(days=365)
+    _best: Optional[str] = None
+    _best_diff: Optional[int] = None
+    for _d in quarterly_by_date:
+        try:
+            _dd = date.fromisoformat(_d)
+        except ValueError:
+            continue
+        _diff = abs((_dd - _target).days)
+        if _diff <= 45 and (_best_diff is None or _diff < _best_diff):
+            _best, _best_diff = _d, _diff
+    if _best is None:
+        return _a_val, _a_end, False
+    return _a_val + quarterly_by_date[_q_end] - quarterly_by_date[_best], _q_end, True
 
 
 def _map_series_to_horizons(series: Dict[str, float]) -> Dict[int, float]:
@@ -588,6 +644,32 @@ def _build_financial_history(
         if end in _ic_by_date and _ic_by_date[end] > 0
     }
 
+    # Trailing-12-month values from 10-Q facts: the Sticker base (current
+    # EPS, owner earnings, FCF) uses the latest four quarters instead of
+    # the last completed fiscal year, so a Sticker isn't a year stale the
+    # day after a 10-K. Big Five, growth, and P/E stay annual. Each
+    # component's TTM is computed from its own quarterly series, so the
+    # windows can differ by a quarter when a filing is missing — the
+    # headline `used` flag tracks the EPS TTM, which drives the Sticker.
+    _ttm_metrics = ("EPS", "Net_Income", "Depreciation_Amortization", "Cap_Ex", "Operating_Cash_Flow")
+    _q_series = {m: _get_best_tag_series(raw_companyfacts, m, splits, quarterly=True) for m in _ttm_metrics}
+    _ttm_vals: Dict[str, Any] = {}
+    _ttm_asof: Optional[str] = None
+    _ttm_used = False
+    for _m in _ttm_metrics:
+        _val, _asof, _used = _ttm_from_series(raw_series.get(_m) or {}, _q_series.get(_m) or {})
+        _ttm_vals[_m] = _val
+        if _m == "EPS":
+            _ttm_used = _used
+            _ttm_asof = _asof
+    _ttm_oe: Optional[float] = None
+    if (_ttm_vals.get("Net_Income") is not None and _ttm_vals.get("Depreciation_Amortization") is not None
+            and _ttm_vals.get("Cap_Ex") is not None):
+        _ttm_oe = _ttm_vals["Net_Income"] + _ttm_vals["Depreciation_Amortization"] - _ttm_vals["Cap_Ex"]
+    _ttm_fcf: Optional[float] = None
+    if _ttm_vals.get("Operating_Cash_Flow") is not None and _ttm_vals.get("Cap_Ex") is not None:
+        _ttm_fcf = _ttm_vals["Operating_Cash_Flow"] - _ttm_vals["Cap_Ex"]
+
     return {
         "ROIC": roic,
         "Equity_Per_Share": equity_per_share,
@@ -628,6 +710,18 @@ def _build_financial_history(
         "_invested_capital_history": invested_capital,
         "_roic_dropped": roic_dropped,
         "_tag_used": tag_used,
+        # Trailing-12-month Sticker inputs (see above) and the latest
+        # fiscal year-end — how old the annual numbers are.
+        "_ttm": {
+            "eps": _ttm_vals.get("EPS"),
+            "owner_earnings": _ttm_oe,
+            "free_cash_flow": _ttm_fcf,
+            "net_income": _ttm_vals.get("Net_Income"),
+            "used": _ttm_used,
+            "as_of": _ttm_asof,
+            "annual_eps": (by_horizon.get("EPS") or {}).get(0),
+        },
+        "_last_fy_end": max(raw_series["EPS"].keys()) if raw_series.get("EPS") else None,
         # Full {fiscal_year_end: value} series (split-adjusted), not
         # horizon-mapped: dividend streaks need every year, and the
         # historical P/E needs each year's EPS paired with its own price.

@@ -4,10 +4,10 @@ valuation.py
 The single place every tab gets its numbers from.
 
   build_snapshot(ticker)  -> everything that does NOT depend on the
-      discount-rate / growth-cap settings: latest price, split-adjusted
-      current EPS, historical growth, multi-year median P/E, Gatekeeper
-      results, dividend-growth streak. Cached on disk, so a long market
-      scan can be interrupted and resumed.
+      discount-rate / growth-cap settings: latest price, trailing-12-month
+      (or latest annual) current EPS, historical growth, multi-year median
+      P/E, Gatekeeper results, dividend-growth streak. Cached on disk, so
+      a long market scan can be interrupted and resumed.
   valuation_from_snapshot(snapshot, discount_rate, max_growth_rate)
       -> Sticker Price / MOS / % undervalued / action, computed instantly
       from a snapshot, so moving a slider never triggers a refetch.
@@ -184,8 +184,11 @@ def _evaluate(ticker: str, prune_unvaluable: bool) -> Tuple[Dict[str, Any], Opti
     if prune_unvaluable:
         # Scan mode: skip the Yahoo call for companies that can't get a
         # Sticker Price anyway (loss-making, or no positive EPS growth).
-        # Splits don't change the sign of EPS or of its growth.
-        cur = eps0.get(0)
+        # Splits don't change the sign of EPS or of its growth. The EPS
+        # check uses the trailing-12-month EPS when there is one — the
+        # same base the Sticker uses — with the annual value as fallback.
+        _ttm_prune = (unadjusted.get("_ttm") or {}).get("eps")
+        cur = _ttm_prune if _ttm_prune is not None else eps0.get(0)
         growth0 = estimate_growth_rate_from_eps_history(eps0)
         if cur is None or cur <= 0:
             return _error(ticker, "EPS is zero or negative", PERMANENT), "pruned"
@@ -201,7 +204,11 @@ def _evaluate(ticker: str, prune_unvaluable: bool) -> Tuple[Dict[str, Any], Opti
     try:
         hist = _build_financial_history(raw, bundle["splits"])
         eps = hist["_eps_history"]
-        current_eps = eps.get(0)
+        ttm = hist.get("_ttm") or {}
+        ttm_eps = ttm.get("eps")
+        # Sticker base is trailing-12-month EPS when the 10-Q data
+        # supports it; growth, P/E, and the Big Five stay annual.
+        current_eps = ttm_eps if ttm_eps is not None else eps.get(0)
         growth_rate = estimate_growth_rate_from_eps_history(eps)
         hist_pe = historical_median_pe(bundle["closes"], hist["_eps_history_by_date"])
         gatekeeper = evaluate_business_quality(hist)
@@ -209,11 +216,13 @@ def _evaluate(ticker: str, prune_unvaluable: bool) -> Tuple[Dict[str, Any], Opti
     except Exception:
         return _error(ticker, "Couldn't compute valuation inputs", PERMANENT), "full"
 
+    _ttm_fcf = ttm.get("free_cash_flow")
+    _fcf_for_div = {0: _ttm_fcf} if _ttm_fcf is not None else (hist.get("Free_Cash_Flow") or {})
     div_metrics = _dividend_metrics(
         hist.get("_dividends_per_share_history") or {},
         current_eps,
         bundle["last_close"],
-        hist.get("Free_Cash_Flow") or {},
+        _fcf_for_div,
         hist.get("_shares_outstanding_history") or {},
     )
     snapshot = {
@@ -231,14 +240,22 @@ def _evaluate(ticker: str, prune_unvaluable: bool) -> Tuple[Dict[str, Any], Opti
         "gatekeeper": gatekeeper,
         "dividend_streak": streak,
         "split_count": len(bundle["splits"]),
+        # Trailing-12-month inputs (missing from older cached snapshots —
+        # callers must use .get() with a fallback): ttm_used says the
+        # Sticker base is TTM, annual_eps is the last fiscal-year EPS
+        # for comparison, last_fy_end is the latest 10-K fiscal year-end.
+        "ttm_used": bool(ttm.get("used")),
+        "ttm_as_of": ttm.get("as_of"),
+        "annual_eps": ttm.get("annual_eps"),
+        "last_fy_end": hist.get("_last_fy_end"),
         # Extra numbers for the ticker card (missing from older cached
         # snapshots — callers must use .get() with a fallback):
-        "owner_earnings": (hist.get("_owner_earnings_history") or {}).get(0),
+        "owner_earnings": ttm.get("owner_earnings") if ttm.get("owner_earnings") is not None else (hist.get("_owner_earnings_history") or {}).get(0),
         "shares_history": hist.get("_shares_outstanding_history") or {},
         # Display-only accuracy numbers (audit table, SBC, interest
         # coverage, total debt, split list). Missing from older cached
         # snapshots; callers must use .get() with a fallback.
-        "free_cash_flow": (hist.get("Free_Cash_Flow") or {}).get(0),
+        "free_cash_flow": ttm.get("free_cash_flow") if ttm.get("free_cash_flow") is not None else (hist.get("Free_Cash_Flow") or {}).get(0),
         "net_income": (hist.get("Net_Income") or {}).get(0),
         "sbc": (hist.get("Share_Based_Compensation") or {}).get(0),
         "sbc_adjusted_fcf": (hist.get("SBC_Adjusted_FCF") or {}).get(0),

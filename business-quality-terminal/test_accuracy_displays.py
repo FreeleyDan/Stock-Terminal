@@ -111,7 +111,7 @@ def main():
               "_project_drip_income", "_projected_income_at_year", "_years_to_goal",
               "_dividend_payment_cut", "_payout_jump_check",
               "_income_attribution", "_observed_income_growth", "_years_to_goal_observed",
-              "_record_goal_month", "_display_purchase_date", "_scan_for_universe"}
+              "_record_goal_month", "_display_purchase_date", "_scan_for_universe", "_ttm_caption"}
     import statistics as _statistics
     import math as _math
     ns: Dict[str, Any] = {
@@ -119,6 +119,7 @@ def main():
         "List": List, "Dict": Dict, "Optional": Optional, "Any": Any,
         "date": _date, "datetime": _datetime,
         "statistics": _statistics, "math": _math,
+        "money": lambda v: "—" if v is None else f"${v:,.2f}",
     }
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in wanted:
@@ -140,6 +141,7 @@ def main():
     m._parse_purchase_date = ns["_parse_purchase_date"]
     m._display_purchase_date = ns["_display_purchase_date"]
     m._scan_for_universe = ns["_scan_for_universe"]
+    m._ttm_caption = ns["_ttm_caption"]
     # Purchase dates: MM-DD-YYYY is what the editor shows, YYYY-MM-DD is
     # what storage holds; both must parse, storage stays ISO.
     assert m._parse_purchase_date("01-15-2024") == _date(2024, 1, 15), "MM-DD-YYYY parses"
@@ -178,6 +180,12 @@ def main():
     ns["get_sp500_tickers"] = lambda: ["AAPL", "MSFT"]
     _view7, _note7, _filt7 = m._scan_for_universe(_all_scan, "S&P 500")
     assert _view7 is _all_scan and _filt7 is False and "Couldn't fetch" in _note7, "tiny fallback list must not filter"
+    # TTM caption: only when the Sticker base is trailing-12-month.
+    _cap = m._ttm_caption({"ttm_used": True, "current_eps": 6.2, "annual_eps": 6.0, "ttm_as_of": "2024-12-31"})
+    assert _cap is not None and "trailing-12-month EPS $6.20" in _cap, _cap
+    assert "12-31-2024" in _cap and "annual EPS was $6.00" in _cap and "Big Five" in _cap, _cap
+    assert m._ttm_caption({"ttm_used": False, "current_eps": 6.0}) is None, "annual base -> no caption"
+    assert m._ttm_caption({}) is None, "old snapshot without TTM keys -> no caption"
     # Income attribution: buys + raises must sum to the income change.
     _b, _r = m._income_attribution(110.0, 2.0, 100.0, 2.0)
     assert (_b, _r) == (20.0, 0.0), (_b, _r)
