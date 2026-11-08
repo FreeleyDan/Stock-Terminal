@@ -7,6 +7,16 @@ the filesystem is ephemeral — a sleep/restart can wipe these files, which
 is why the app also offers Download/Import for the portfolio and saves
 the last scan to a file. Export anything you want to keep.)
 
+Google Sheets backend: when Streamlit secrets carry a sheet id and a
+service-account credential, the same data ALSO lives in a Google Sheet
+(worksheet "data": header row + one JSON chunk per row), and the Sheet is
+the source of truth — a Cloud reboot can no longer wipe the portfolio
+(it did exactly that on Nov 6, 2026). The local file stays as a cache
+and fallback. Sheets only engages for the default DATA_FILE path, so
+test paths always stay local. gspread is imported lazily, so a missing
+dependency can never crash startup; every Sheets failure falls back to
+local and a save never raises.
+
 Last-scan results are saved as a pickle (not JSON) because snapshots
 carry integer-keyed gatekeeper dicts that JSON would turn into strings.
 """
@@ -240,21 +250,9 @@ def _clean_holdings_baseline(raw_baseline: Any) -> Dict[str, Any]:
     return baseline
 
 
-def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
-    """Never raises. A corrupt file is moved aside (.corrupt) and replaced
-    by an empty one rather than crashing the app."""
-    if not os.path.exists(path):
-        return _empty()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError("bad shape")
-    except Exception:
-        try:
-            shutil.move(path, path + ".corrupt")
-        except Exception:
-            pass
+def _clean_loaded(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate/clean a parsed user-data dict (from disk or Sheets)."""
+    if not isinstance(data, dict):
         return _empty()
 
     portfolios = _clean_portfolios(data.get("portfolios"), data.get("portfolio", []))
@@ -337,12 +335,256 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Google Sheets backend (persistent storage)
+# ---------------------------------------------------------------------------
+# Config comes from Streamlit secrets (the app runs unattended on Cloud):
+#   [stock_terminal]
+#   sheet_id = "..."
+#   [gcp_service_account]
+#   type = "service_account"
+#   ... (the service-account JSON)
+# ...or the env vars STOCK_TERMINAL_SHEET_ID / STOCK_TERMINAL_GCP_SA_JSON
+# (handy for local testing). The service account needs the Google Sheets
+# API and the Google Drive API enabled, and the sheet shared with it as
+# Editor (gspread opens the spreadsheet by key, which uses Drive).
+# Single user, single container: last-writer-wins by saved-at timestamp.
+
+SHEETS_WORKSHEET = "data"
+SHEETS_MARKER = "STOCK-TERMINAL-DATA"
+SHEETS_CHUNK_CHARS = 40000  # Sheets cells cap at 50,000 chars
+SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+_SHEETS_CONFIG: Optional[Tuple[Optional[str], Optional[Dict[str, Any]]]] = None
+_LAST_SHEETS_SAVED_AT: Optional[str] = None
+
+
+def _sheets_config() -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """(sheet_id, service-account dict) or (None, None). Cached per run."""
+    global _SHEETS_CONFIG
+    if _SHEETS_CONFIG is not None:
+        return _SHEETS_CONFIG
+    result: Tuple[Optional[str], Optional[Dict[str, Any]]] = (None, None)
+    try:
+        env_id = os.environ.get("STOCK_TERMINAL_SHEET_ID", "").strip()
+        env_sa = os.environ.get("STOCK_TERMINAL_GCP_SA_JSON", "").strip()
+        if env_id and env_sa:
+            result = (env_id, json.loads(env_sa))
+        else:
+            import streamlit as st  # lazy: storage is also used by tests
+            secrets = st.secrets
+            sheet_id = None
+            creds = None
+            for _key in ("stock_terminal_sheet_id",):
+                try:
+                    sheet_id = secrets.get(_key)
+                except Exception:
+                    pass
+            for _key in ("gcp_service_account",):
+                try:
+                    creds = secrets.get(_key)
+                except Exception:
+                    pass
+            if not sheet_id or not creds:
+                try:
+                    section = secrets.get("stock_terminal") or {}
+                    sheet_id = sheet_id or section.get("sheet_id")
+                    creds = creds or section.get("service_account")
+                except Exception:
+                    pass
+            if isinstance(creds, str):
+                try:
+                    creds = json.loads(creds)
+                except Exception:
+                    creds = None
+            if sheet_id and creds:
+                result = (str(sheet_id), dict(creds))
+    except Exception:
+        result = (None, None)
+    _SHEETS_CONFIG = result
+    return result
+
+
+def _reset_sheets_config_cache() -> None:
+    """Tests only: forget the cached Sheets config so env changes take effect."""
+    global _SHEETS_CONFIG
+    _SHEETS_CONFIG = None
+
+
+def _set_backend_flag(value: str) -> None:
+    """Tell the UI which store is live (Dashboard caption). No-op outside Streamlit."""
+    try:
+        import streamlit as st
+        st.session_state["storage_backend"] = value
+    except Exception:
+        pass
+
+
+def _sheets_worksheet(sheet_id: str, creds: Dict[str, Any]):
+    """Open (creating if needed) the 'data' worksheet. Raises on failure."""
+    import gspread  # lazy: a missing dep must not break startup
+    from google.oauth2.service_account import Credentials
+
+    credentials = Credentials.from_service_account_info(creds, scopes=SHEETS_SCOPES)
+    client = gspread.authorize(credentials)
+    book = client.open_by_key(sheet_id)
+    try:
+        return book.worksheet(SHEETS_WORKSHEET)
+    except Exception:
+        return book.add_worksheet(SHEETS_WORKSHEET, rows=1000, cols=2)
+
+
+def _sheets_split(text: str) -> List[str]:
+    return [text[i:i + SHEETS_CHUNK_CHARS] for i in range(0, len(text), SHEETS_CHUNK_CHARS)] or [""]
+
+
+def _sheets_read(worksheet) -> Tuple[Optional[Dict[str, Any]], Optional[str], str]:
+    """(data, saved_at_iso, state) with state in {"ok", "empty", "corrupt"}.
+    "empty" = no marker row yet (fresh sheet). "corrupt" = marker present
+    but the JSON won't parse — never overwrite it blindly."""
+    try:
+        rows = worksheet.get_all_values()
+    except Exception:
+        return None, None, "corrupt"
+    if not rows or not rows[0] or rows[0][0] != SHEETS_MARKER:
+        return None, None, "empty"
+    header = rows[0]
+    saved_at = header[1] if len(header) > 1 else None
+    try:
+        count = int(header[2]) if len(header) > 2 else 0
+    except (TypeError, ValueError):
+        return None, None, "corrupt"
+    chunks = []
+    for r in rows[1:1 + count]:
+        if r:
+            chunks.append(r[0])
+    try:
+        data = json.loads("".join(chunks))
+    except Exception:
+        return None, None, "corrupt"
+    if not isinstance(data, dict):
+        return None, None, "corrupt"
+    return data, saved_at, "ok"
+
+
+def _sheets_write(worksheet, data: Dict[str, Any]) -> bool:
+    """Replace the sheet contents with header + JSON chunks. Never raises."""
+    global _LAST_SHEETS_SAVED_AT
+    try:
+        text = json.dumps(data, separators=(",", ":"))
+        chunks = _sheets_split(text)
+        now = datetime.now(timezone.utc).isoformat()
+        values = [[SHEETS_MARKER, now, str(len(chunks))]] + [[c] for c in chunks]
+        worksheet.clear()
+        worksheet.update("A1", values, value_input_option="RAW")
+        _LAST_SHEETS_SAVED_AT = now
+        return True
+    except Exception:
+        return False
+
+
+def _load_from_file(path: str) -> Dict[str, Any]:
+    """Read + clean the local JSON file. Never raises; a corrupt file is
+    moved aside (.corrupt) and replaced by an empty one."""
+    if not os.path.exists(path):
+        return _empty()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("bad shape")
+    except Exception:
+        try:
+            shutil.move(path, path + ".corrupt")
+        except Exception:
+            pass
+        return _empty()
+    return _clean_loaded(data)
+
+
+def _file_mtime(path: str) -> Optional[float]:
+    try:
+        return os.path.getmtime(path)
+    except Exception:
+        return None
+
+
+def _parse_sheet_ts(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except Exception:
+        return None
+
+
+def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
+    """Never raises. When Google Sheets is configured (and this is the
+    default DATA_FILE path — test paths always stay local), the Sheet is
+    the source of truth and the local file is a cache/fallback:
+    - Sheet empty + local has data -> migrate local up once.
+    - Sheet has data -> last-writer-wins by saved-at timestamp, so a
+      local save made during a Sheets outage heals the Sheet on next load.
+    - Sheet unreachable/corrupt -> local file, so the app keeps working."""
+    global _LAST_SHEETS_SAVED_AT
+    local = _load_from_file(path)
+    if os.path.abspath(path) != DATA_FILE:
+        _set_backend_flag("local")
+        return local
+    sheet_id, creds = _sheets_config()
+    if not sheet_id or not creds:
+        _set_backend_flag("local")
+        return local
+    try:
+        ws = _sheets_worksheet(sheet_id, creds)
+        sheet_data, sheet_saved_at, state = _sheets_read(ws)
+    except Exception:
+        _set_backend_flag("sheets-unavailable")
+        return local
+    if state == "corrupt":
+        _set_backend_flag("sheets-unavailable")
+        return local
+    if state == "empty":
+        if local != _empty():
+            if _sheets_write(ws, local):
+                _set_backend_flag("sheets")
+            else:
+                _set_backend_flag("sheets-unavailable")
+        else:
+            _set_backend_flag("sheets")
+        return local
+    # state == "ok": last-writer-wins by saved-at timestamp.
+    sheet_data_clean = _clean_loaded(sheet_data)
+    local_mtime = _file_mtime(path)
+    sheet_ts = _parse_sheet_ts(sheet_saved_at)
+    if local_mtime is not None and sheet_ts is not None and local_mtime > sheet_ts and local != sheet_data_clean:
+        if _sheets_write(ws, local):
+            _set_backend_flag("sheets")
+        else:
+            _set_backend_flag("sheets-unavailable")
+        return local
+    if sheet_saved_at:
+        _LAST_SHEETS_SAVED_AT = sheet_saved_at
+    _set_backend_flag("sheets")
+    try:
+        _write_local_file(sheet_data_clean, path)
+    except Exception:
+        pass
+    return sheet_data_clean
+
+
 def last_saved_display(path: str = DATA_FILE) -> Optional[str]:
-    """When user_data.json was last written on this server, or None if
-    there is no saved file here. Used for the persistence warning in
-    the UI: Streamlit Cloud's filesystem is ephemeral, so a restart or
-    sleep can wipe the file, and the export download is the permanent
-    copy. The file's mtime is the save time — no extra field needed."""
+    """When user_data.json was last written on this server, or the Sheet's
+    saved-at time when Sheets is the live store; None if nothing saved.
+    Used for the persistence note in the UI: Streamlit Cloud's filesystem
+    is ephemeral, so a restart or sleep can wipe the file, and the export
+    download is the permanent copy. The file's mtime is the save time —
+    no extra field needed."""
+    if _LAST_SHEETS_SAVED_AT:
+        try:
+            return datetime.fromisoformat(_LAST_SHEETS_SAVED_AT).strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            return _LAST_SHEETS_SAVED_AT[:16]
     try:
         mtime = os.path.getmtime(path)
     except Exception:
@@ -350,8 +592,8 @@ def last_saved_display(path: str = DATA_FILE) -> Optional[str]:
     return datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def save_user_data(data: Dict[str, Any], path: str = DATA_FILE) -> bool:
-    """Atomic write. Returns False (never raises) if it couldn't save."""
+def _write_local_file(data: Dict[str, Any], path: str) -> bool:
+    """Atomic local write. Returns False (never raises) on failure."""
     try:
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -360,6 +602,32 @@ def save_user_data(data: Dict[str, Any], path: str = DATA_FILE) -> bool:
         return True
     except Exception:
         return False
+
+
+def save_user_data(data: Dict[str, Any], path: str = DATA_FILE) -> bool:
+    """Save to the Sheet when configured (default path only), always keeping
+    the local file as a fallback copy. A Sheet failure never loses the save
+    — it lands locally and heals the Sheet on the next load. Never raises."""
+    if os.path.abspath(path) != DATA_FILE:
+        _set_backend_flag("local")
+        return _write_local_file(data, path)
+    sheet_id, creds = _sheets_config()
+    if not sheet_id or not creds:
+        _set_backend_flag("local")
+        return _write_local_file(data, path)
+    try:
+        ws = _sheets_worksheet(sheet_id, creds)
+        if _sheets_write(ws, data):
+            _set_backend_flag("sheets")
+            try:
+                _write_local_file(data, path)
+            except Exception:
+                pass
+            return True
+    except Exception:
+        pass
+    _set_backend_flag("sheets-unavailable")
+    return _write_local_file(data, path)
 
 
 def save_portfolio(holdings: List[Dict[str, Any]], name: str = "Main", path: str = DATA_FILE) -> bool:

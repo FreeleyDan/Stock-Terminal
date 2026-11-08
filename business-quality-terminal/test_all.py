@@ -363,6 +363,95 @@ check("record goal month with attribution",
       {"month": "2026-11", "income": 5200.0, "goal": 12000.0, "buys": 300.0, "raises": 50.0})
 
 # --------------------------------------------------------------------------
+section("Sheets backend")
+
+
+class _FakeSheet:
+    """In-memory stand-in for a gspread worksheet."""
+    def __init__(self):
+        self.rows = []
+        self.writes = 0
+
+    def get_all_values(self):
+        return [list(r) for r in self.rows]
+
+    def clear(self):
+        self.rows = []
+
+    def update(self, _range, values, value_input_option="RAW"):
+        self.rows = [list(r) for r in values]
+        self.writes += 1
+
+
+_fake = _FakeSheet()
+_orig_config = storage._sheets_config
+_orig_worksheet = storage._sheets_worksheet
+_orig_data_file = storage.DATA_FILE
+_sheets_tmp = os.path.join(TMP, "sheets_user_data.json")
+storage.DATA_FILE = _sheets_tmp
+storage._sheets_config = lambda: ("fake-sheet-id", {"type": "service_account"})
+storage._sheets_worksheet = lambda _sid, _creds: _fake
+try:
+    check("sheets chunk boundary 40000 -> 1", len(storage._sheets_split("x" * 40000)), 1)
+    check("sheets chunk boundary 40001 -> 2", len(storage._sheets_split("x" * 40001)), 2)
+    _big = {"signal_log": [{"date": "2026-01-01", "ticker": "AAPL", "price": 1.0, "sticker": 2.0, "signal": "HOLD", "lean": ""} for _ in range(600)]}
+    check("sheets write + read round-trips >50k chars",
+          storage._sheets_write(_fake, _big) and storage._sheets_read(_fake)[0] == _big, True)
+    check("sheets write split into 2+ chunks", len(_fake.rows) - 1 >= 2, True)
+    _fake.rows = []
+    check("sheets empty sheet reads as empty", storage._sheets_read(_fake)[2], "empty")
+    _fake.rows = [[storage.SHEETS_MARKER, "2026-01-01T00:00:00+00:00", "1"], ["{bad json"]]
+    check("sheets corrupt JSON reads as corrupt, never ok", storage._sheets_read(_fake)[2], "corrupt")
+    # Migration: empty sheet + local data -> local uploads to the sheet.
+    _fake.rows = []
+    with open(_sheets_tmp, "w") as f:
+        json.dump({"portfolios": {"Main": [{"ticker": "SCHD", "shares": 10.0, "avg_cost": 80.0}]}}, f)
+    d = storage.load_user_data(_sheets_tmp)
+    check("sheets migration returns the local data", d["portfolios"]["Main"][0]["ticker"], "SCHD")
+    check("sheets migration uploads local to the sheet", storage._sheets_read(_fake)[2], "ok")
+    # Sheet wins when local is missing.
+    _fake.rows = []
+    storage._sheets_write(_fake, {"portfolios": {"Main": [{"ticker": "VOO", "shares": 5.0, "avg_cost": 500.0, "drip": False}]}})
+    if os.path.exists(_sheets_tmp):
+        os.remove(_sheets_tmp)
+    d = storage.load_user_data(_sheets_tmp)
+    check("sheets data loads when the local file is gone", d["portfolios"]["Main"][0]["ticker"], "VOO")
+    check("sheets load caches the sheet copy locally", os.path.exists(_sheets_tmp), True)
+    # Local-newer heal: sheet old, local written after it -> local wins and heals the sheet.
+    _fake.rows = []
+    storage._sheets_write(_fake, {"portfolios": {"Main": [{"ticker": "KO", "shares": 1.0, "avg_cost": 60.0, "drip": False}]}})
+    time.sleep(0.05)
+    with open(_sheets_tmp, "w") as f:
+        json.dump({"portfolios": {"Main": [{"ticker": "SCHD", "shares": 10.0, "avg_cost": 80.0}]}}, f)
+    d = storage.load_user_data(_sheets_tmp)
+    check("local-newer load returns the local data", d["portfolios"]["Main"][0]["ticker"], "SCHD")
+    check("local-newer load heals the sheet", storage._sheets_read(_fake)[0]["portfolios"]["Main"][0]["ticker"], "SCHD")
+    # Outage: worksheet open raises -> load/save fall back to local, never raise.
+    def _raising(_sid, _creds):
+        raise RuntimeError("sheets down")
+    storage._sheets_worksheet = _raising
+    with open(_sheets_tmp, "w") as f:
+        json.dump({"portfolios": {"Main": [{"ticker": "SCHD", "shares": 10.0, "avg_cost": 80.0}]}}, f)
+    d = storage.load_user_data(_sheets_tmp)
+    check("sheets outage load falls back to local", d["portfolios"]["Main"][0]["ticker"], "SCHD")
+    check("sheets outage save still lands locally",
+          storage.save_user_data({"portfolios": {"Main": [{"ticker": "SCHD", "shares": 10.0, "avg_cost": 80.0, "drip": False}]}}, _sheets_tmp)
+          and storage.load_user_data(_sheets_tmp)["portfolios"]["Main"][0]["ticker"], "SCHD")
+    storage._sheets_worksheet = lambda _sid, _creds: _fake
+    # A non-default path never touches the sheet, even when configured.
+    _writes_before = _fake.writes
+    _other = os.path.join(TMP, "other_user_data.json")
+    storage.save_user_data({"portfolios": {"Main": [{"ticker": "AAPL", "shares": 1.0, "avg_cost": 1.0, "drip": False}]}}, _other)
+    storage.load_user_data(_other)
+    check("non-default path never touches the sheet", _fake.writes, _writes_before)
+finally:
+    storage._sheets_config = _orig_config
+    storage._sheets_worksheet = _orig_worksheet
+    storage.DATA_FILE = _orig_data_file
+    storage._reset_sheets_config_cache()
+
+
+# --------------------------------------------------------------------------
 section("Scanner")
 
 

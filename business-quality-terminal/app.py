@@ -463,6 +463,24 @@ def _display_purchase_date(value: Any) -> str:
     return _d.strftime("%m-%d-%Y") if _d else ""
 
 
+def _storage_status_line(last_saved: Optional[str] = None) -> str:
+    """Where user data lives, from the flag storage.py sets on every
+    load/save (session_state["storage_backend"]). With a time, the full
+    "Saved ..." sentence; without one, the short form for the Dashboard."""
+    _backend = st.session_state.get("storage_backend", "local")
+    if _backend == "sheets":
+        if last_saved:
+            return f"Saved to Google Sheets: {last_saved}. Survives restarts."
+        return "Saved to Google Sheets — survives restarts."
+    if _backend == "sheets-unavailable":
+        if last_saved:
+            return f"Google Sheets is unreachable — saving locally (last save {last_saved}), will sync when it's back."
+        return "Google Sheets is unreachable right now — saving locally, will sync when it's back."
+    if last_saved:
+        return f"Saved on this server: {last_saved}. A restart can wipe it; the backup download is your copy."
+    return "Saved on this server only — a restart can wipe it; the backup download is your copy."
+
+
 def _ttm_caption(snap: Dict[str, Any]) -> Optional[str]:
     """One-line note when the Sticker uses trailing-12-month inputs."""
     if not snap.get("ttm_used"):
@@ -1416,7 +1434,7 @@ with tab_dashboard:
         )
     st.caption(
         "Backup holds everything — portfolios, watchlists, manual data, goal history, tax settings, sales log, "
-        "presets. On Streamlit Cloud the saved file can be wiped on sleep/restart; this download is your copy. "
+        "presets. " + _storage_status_line() + " "
         "Prices already refresh on their own when older than 15 minutes — the button forces fresh prices now."
     )
     _dash_portfolios = _dash_data.get("portfolios") or {}
@@ -1797,8 +1815,7 @@ with tab_portfolio:
     st.session_state["pf_selected_name"] = pf_name
     _last_saved = last_saved_display()
     st.caption(
-        ("Saved on this server: " + _last_saved + ". " if _last_saved else "No saved file on this server yet. ")
-        + "Streamlit Cloud storage is ephemeral — a restart or sleep can wipe portfolios, watchlists, and notes. "
+        _storage_status_line(_last_saved) + " "
         "Use Export (below) after important changes to keep a permanent copy."
     )
     new_pf_col1, new_pf_col2, new_pf_col3 = st.columns(3)
@@ -2410,8 +2427,7 @@ with tab_watchlist:
     st.session_state["wl_selected_name"] = wl_name
     _last_saved_wl = last_saved_display()
     st.caption(
-        ("Saved on this server: " + _last_saved_wl + ". " if _last_saved_wl else "No saved file on this server yet. ")
-        + "Streamlit Cloud storage is ephemeral — a restart or sleep can wipe portfolios, watchlists, and notes. "
+        _storage_status_line(_last_saved_wl) + " "
         "Use Export on the Portfolio tab after important changes to keep a permanent copy."
     )
     wl_c1, wl_c2, wl_c3 = st.columns(3)
@@ -3077,8 +3093,8 @@ with tab_dividends:
         )
         st.caption(
             "Note: dividend metrics come from fresh SEC filings. A scan cached before this update won't have them "
-            "(shows \u2014) — click Refresh data on the Ticker Lookup tab, or wait for the 24-hour cache to expire, "
-            "then re-run the scan."
+            "(shows \u2014) — click Refresh data in the sidebar (bottom, under the sliders), or wait for the "
+            "24-hour cache to expire, then re-run the scan."
         )
     else:
         st.info("Run a scan on the Top 25 Undervalued tab first; this tab reuses its results.")
