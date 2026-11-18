@@ -404,6 +404,7 @@ try:
     check("sheets corrupt JSON reads as corrupt, never ok", storage._sheets_read(_fake)[2], "corrupt")
     # Migration: empty sheet + local data -> local uploads to the sheet.
     _fake.rows = []
+    storage._reset_sheets_read_cache()
     with open(_sheets_tmp, "w") as f:
         json.dump({"portfolios": {"Main": [{"ticker": "SCHD", "shares": 10.0, "avg_cost": 80.0}]}}, f)
     d = storage.load_user_data(_sheets_tmp)
@@ -430,6 +431,9 @@ try:
     def _raising(_sid, _creds):
         raise RuntimeError("sheets down")
     storage._sheets_worksheet = _raising
+    # The cache would mask the outage (a hit returns without opening),
+    # so forget it — this load must actually hit the failing worksheet.
+    storage._reset_sheets_read_cache()
     with open(_sheets_tmp, "w") as f:
         json.dump({"portfolios": {"Main": [{"ticker": "SCHD", "shares": 10.0, "avg_cost": 80.0}]}}, f)
     d = storage.load_user_data(_sheets_tmp)
@@ -444,11 +448,42 @@ try:
     storage.save_user_data({"portfolios": {"Main": [{"ticker": "AAPL", "shares": 1.0, "avg_cost": 1.0, "drip": False}]}}, _other)
     storage.load_user_data(_other)
     check("non-default path never touches the sheet", _fake.writes, _writes_before)
+    # Read cache: one sheet read serves repeated loads for a minute, so
+    # dozens of load_user_data() calls per rerun cost one API read.
+    _open_count = {"n": 0}
+    def _counting(_sid, _creds):
+        _open_count["n"] += 1
+        return _fake
+    storage._sheets_worksheet = _counting
+    storage._sheets_write(_fake, {"portfolios": {"Main": [{"ticker": "SCHD", "shares": 10.0, "avg_cost": 80.0, "drip": False}]}})
+    if os.path.exists(_sheets_tmp):
+        os.remove(_sheets_tmp)
+    storage._reset_sheets_read_cache()
+    storage.load_user_data(_sheets_tmp)
+    storage.load_user_data(_sheets_tmp)
+    storage.load_user_data(_sheets_tmp)
+    check("sheets read cache: repeated loads make one API read", _open_count["n"], 1)
+    # A save warms the cache: the next load needs no API read either.
+    storage._reset_sheets_read_cache()
+    storage.save_user_data({"portfolios": {"Main": [{"ticker": "VOO", "shares": 5.0, "avg_cost": 500.0, "drip": False}]}}, _sheets_tmp)
+    _open_count["n"] = 0
+    d = storage.load_user_data(_sheets_tmp)
+    check("sheets save warms the read cache", (_open_count["n"], d["portfolios"]["Main"][0]["ticker"]), (0, "VOO"))
+    # The cache expires: with a 0.05s TTL the next load re-reads.
+    _open_count["n"] = 0
+    _orig_ttl = storage._SHEETS_READ_TTL_SECONDS
+    storage._SHEETS_READ_TTL_SECONDS = 0.05
+    time.sleep(0.1)
+    storage.load_user_data(_sheets_tmp)
+    check("sheets read cache expires after its TTL", _open_count["n"], 1)
+    storage._SHEETS_READ_TTL_SECONDS = _orig_ttl
+    storage._sheets_worksheet = lambda _sid, _creds: _fake
 finally:
     storage._sheets_config = _orig_config
     storage._sheets_worksheet = _orig_worksheet
     storage.DATA_FILE = _orig_data_file
     storage._reset_sheets_config_cache()
+    storage._reset_sheets_read_cache()
 
 
 # --------------------------------------------------------------------------

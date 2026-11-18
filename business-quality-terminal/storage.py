@@ -4,7 +4,7 @@ storage.py
 Persists the portfolio, watchlist, and Buffett notes to user_data.json
 next to the app so they survive restarts. (On Streamlit Community Cloud
 the filesystem is ephemeral — a sleep/restart can wipe these files, which
-is why the app also offers Download/Import for the portfolio and saves
+is why the app also offers Download for the portfolio and saves
 the last scan to a file. Export anything you want to keep.)
 
 Google Sheets backend: when Streamlit secrets carry a sheet id and a
@@ -23,6 +23,7 @@ carry integer-keyed gatekeeper dicts that JSON would turn into strings.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import pickle
@@ -358,6 +359,22 @@ SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 _SHEETS_CONFIG: Optional[Tuple[Optional[str], Optional[Dict[str, Any]]]] = None
 _LAST_SHEETS_SAVED_AT: Optional[str] = None
 
+# One cached sheet read serves every load_user_data() call for a minute.
+# The app calls load_user_data() dozens of times per Streamlit rerun —
+# and once per snapshot on the Dividend tab — so without this a few
+# clicks exhaust the Sheets API's 60-reads-per-minute-per-user quota and
+# every load/save reports the sheet unreachable. A cached read can be up
+# to 60s stale vs. edits made outside the app; the app's own writes
+# update the cache immediately, so its own saves are never stale.
+_SHEETS_READ_TTL_SECONDS = 60.0
+_SHEETS_READ_CACHE: Optional[Tuple[float, Optional[Dict[str, Any]], Optional[str], str]] = None
+
+
+def _reset_sheets_read_cache() -> None:
+    """Tests only: forget the cached sheet read."""
+    global _SHEETS_READ_CACHE
+    _SHEETS_READ_CACHE = None
+
 
 def _sheets_config() -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """(sheet_id, service-account dict) or (None, None). Cached per run."""
@@ -467,9 +484,35 @@ def _sheets_read(worksheet) -> Tuple[Optional[Dict[str, Any]], Optional[str], st
     return data, saved_at, "ok"
 
 
+def _open_worksheet(sheet_id: str, creds: Dict[str, Any]):
+    """Open the 'data' worksheet, or None on failure (never raises)."""
+    try:
+        return _sheets_worksheet(sheet_id, creds)
+    except Exception:
+        return None
+
+
+def _cached_sheets_read(sheet_id: str, creds: Dict[str, Any]):
+    """(data, saved_at, state, worksheet-or-None). A fresh cache hit makes
+    no API call and opens no worksheet; callers that need to write must
+    open the worksheet themselves. Raises when the sheet can't be opened
+    or read and there is no fresh cache to serve. Callers get a deep copy
+    of cached data, so mutating a loaded dict never poisons the cache."""
+    global _SHEETS_READ_CACHE
+    now = time.monotonic()
+    if _SHEETS_READ_CACHE is not None:
+        read_at, cached_data, cached_saved_at, cached_state = _SHEETS_READ_CACHE
+        if now - read_at < _SHEETS_READ_TTL_SECONDS:
+            return copy.deepcopy(cached_data), cached_saved_at, cached_state, None
+    ws = _sheets_worksheet(sheet_id, creds)
+    data, saved_at, state = _sheets_read(ws)
+    _SHEETS_READ_CACHE = (now, data, saved_at, state)
+    return copy.deepcopy(data), saved_at, state, ws
+
+
 def _sheets_write(worksheet, data: Dict[str, Any]) -> bool:
     """Replace the sheet contents with header + JSON chunks. Never raises."""
-    global _LAST_SHEETS_SAVED_AT
+    global _LAST_SHEETS_SAVED_AT, _SHEETS_READ_CACHE
     try:
         text = json.dumps(data, separators=(",", ":"))
         chunks = _sheets_split(text)
@@ -478,6 +521,9 @@ def _sheets_write(worksheet, data: Dict[str, Any]) -> bool:
         worksheet.clear()
         worksheet.update("A1", values, value_input_option="RAW")
         _LAST_SHEETS_SAVED_AT = now
+        # A successful write proves the sheet holds exactly this data —
+        # warm the read cache so the next load needs no API call.
+        _SHEETS_READ_CACHE = (time.monotonic(), json.loads(text), now, "ok")
         return True
     except Exception:
         return False
@@ -536,8 +582,7 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
         _set_backend_flag("local")
         return local
     try:
-        ws = _sheets_worksheet(sheet_id, creds)
-        sheet_data, sheet_saved_at, state = _sheets_read(ws)
+        sheet_data, sheet_saved_at, state, ws = _cached_sheets_read(sheet_id, creds)
     except Exception:
         _set_backend_flag("sheets-unavailable")
         return local
@@ -546,7 +591,10 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
         return local
     if state == "empty":
         if local != _empty():
-            if _sheets_write(ws, local):
+            # A cache hit opens no worksheet — open one only when a write
+            # is actually needed.
+            ws = ws or _open_worksheet(sheet_id, creds)
+            if ws is not None and _sheets_write(ws, local):
                 _set_backend_flag("sheets")
             else:
                 _set_backend_flag("sheets-unavailable")
@@ -558,7 +606,8 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
     local_mtime = _file_mtime(path)
     sheet_ts = _parse_sheet_ts(sheet_saved_at)
     if local_mtime is not None and sheet_ts is not None and local_mtime > sheet_ts and local != sheet_data_clean:
-        if _sheets_write(ws, local):
+        ws = ws or _open_worksheet(sheet_id, creds)
+        if ws is not None and _sheets_write(ws, local):
             _set_backend_flag("sheets")
         else:
             _set_backend_flag("sheets-unavailable")

@@ -291,14 +291,20 @@ def _manual_for(ticker: str) -> Dict[str, Any]:
         return {}
 
 
-def _apply_manual_to_snapshot(snap: Dict[str, Any]) -> Dict[str, Any]:
+def _apply_manual_to_snapshot(snap: Dict[str, Any], manual_map: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Return a copy of a snapshot with the user's manual dividend fields
     applied. Manual fields are tracked separately in the copy as
     "manual_fields" (a list of field names) so the table can flag them
     with ✏️. The original session-state scan is never mutated.
+    Pass manual_map (the "manual" dict from one load_user_data call) when
+    applying to many snapshots at once — the default loads it per call,
+    which re-reads the Sheet once per snapshot on the Dividend tab.
     """
-    manual = _manual_for(snap.get("ticker", ""))
+    if manual_map is None:
+        manual = _manual_for(snap.get("ticker", ""))
+    else:
+        manual = (manual_map or {}).get(normalize_ticker(snap.get("ticker", "")), {}) or {}
     if not manual:
         out = dict(snap)
         out["manual_fields"] = []
@@ -2400,7 +2406,7 @@ with tab_portfolio:
             mime="application/json",
             key="pf_export_btn",
         )
-        st.caption("Keep this file as your backup — on Streamlit Cloud the saved file can be wiped on sleep/restart, and this download is how you restore it (Import above).")
+        st.caption("Keep this file as your backup — on Streamlit Cloud the saved file can be wiped on sleep/restart.")
 
 
 # --- 3. Watchlist ---------------------------------------------------------
@@ -2591,7 +2597,11 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
     if dividend_mode:
         # Apply manual dividend data first, so manual values count for
         # filters, Chowder, and the safety score — and are flagged ✏️.
-        snapshots_for_rank = [_apply_manual_to_snapshot(s) for s in snapshots_for_rank]
+        # Load the manual map ONCE: the old per-snapshot load re-read the
+        # Sheet once per snapshot (hundreds of reads per render), which
+        # exhausted the Sheets API quota and stalled this tab.
+        _manual_map = load_user_data().get("manual") or {}
+        snapshots_for_rank = [_apply_manual_to_snapshot(s, _manual_map) for s in snapshots_for_rank]
         filtered = []
         for snap in snapshots_for_rank:
             if snap.get("error"):
@@ -2655,9 +2665,11 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
         st.info("Nothing matched. Loosen the filters, or run a wider scan.")
     else:
         rows = []
+        # Load the notes map once — _notes_for re-reads storage per row.
+        _notes_map = load_user_data().get("notes") or {}
         snap_map_all = {s.get("ticker"): s for s in snapshots_for_rank}
         for i, r in enumerate(ranked["top_results"], start=1):
-            note_scan = _notes_for(r["ticker"])
+            note_scan = _notes_map.get(normalize_ticker(r["ticker"]), {}) or {}
             snap_row = snap_map_all.get(r["ticker"], {})
             comp_row = _data_completeness(snap_row.get("gatekeeper") or {}) if snap_row else {"metrics": 0, "horizons": 0, "missing_metrics": []}
             peg_row = _peg_ratio(snap_row) if snap_row else None
