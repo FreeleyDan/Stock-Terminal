@@ -40,6 +40,11 @@ from data_fetcher import (
 from gatekeeper import determine_action, evaluate_business_quality
 
 SNAPSHOT_TTL_SECONDS = 24 * 60 * 60
+# Bump when the snapshot shape changes (e.g. a new score) so every cached
+# snapshot rebuilds with the new code on the next render instead of serving
+# stale pre-change data until its 24h TTL expires. v2: the Moat Score
+# (pre-rename snapshots carry no real moat — see app.py's moat_score()).
+SNAPSHOT_CACHE_VERSION = 2
 DEFAULT_MAX_GROWTH_RATE = 0.15
 
 PERMANENT = "permanent"
@@ -377,8 +382,8 @@ def build_snapshot(
     ticker = normalize_ticker(ticker)
     if not ticker:
         return _error("", "Empty ticker", PERMANENT)
-    full_key = f"snapshot:{ticker}"
-    pruned_key = f"snapshot_pruned:{ticker}"
+    full_key = f"snapshot:v{SNAPSHOT_CACHE_VERSION}:{ticker}"
+    pruned_key = f"snapshot_pruned:v{SNAPSHOT_CACHE_VERSION}:{ticker}"
 
     try:
         hit = cache_get(full_key, SNAPSHOT_TTL_SECONDS)

@@ -203,15 +203,16 @@ before = state["raw_calls"]
 valuation.build_snapshot("TEST", price_max_age=3600)
 check("second call served from cache (no refetch)", state["raw_calls"], before)
 
-# stale price refresh
-cached_snap = df_mod.cache_get("snapshot:TEST", 3600)
+# stale price refresh (cache key carries the snapshot version — see valuation)
+_snap_key = f"snapshot:v{valuation.SNAPSHOT_CACHE_VERSION}:TEST"
+cached_snap = df_mod.cache_get(_snap_key, 3600)
 cached_snap["price_asof"] -= 7200
-df_mod.cache_set("snapshot:TEST", cached_snap)
+df_mod.cache_set(_snap_key, cached_snap)
 refreshed = valuation.build_snapshot("TEST", price_max_age=3600)
 check("stale price is refreshed with the cheap latest-price call", (refreshed["current_price"], state["latest_calls"]), (111.0, 1))
 check("...without refetching fundamentals", state["raw_calls"], before)
 state["latest"] = None
-cached_snap = df_mod.cache_get("snapshot:TEST", 3600); cached_snap["price_asof"] -= 99999; df_mod.cache_set("snapshot:TEST", cached_snap)
+cached_snap = df_mod.cache_get(_snap_key, 3600); cached_snap["price_asof"] -= 99999; df_mod.cache_set(_snap_key, cached_snap)
 check("price refresh failure keeps the older price instead of erroring",
       valuation.build_snapshot("TEST", price_max_age=3600)["current_price"], 111.0)
 
