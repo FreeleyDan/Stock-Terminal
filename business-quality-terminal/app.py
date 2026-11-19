@@ -80,6 +80,20 @@ except ImportError:  # deployed signals.py can lag the repo behind app.py
             return q if q is not None else 0.0
         q = snapshot.get("moat_score")
         return q if q is not None else 0.0
+
+
+def moat_score(snapshot: Dict[str, Any]) -> Optional[float]:
+    """
+    The real Moat Score (0-100), or None when the snapshot predates it.
+    Pre-rename snapshots carry only "moat_score" — which WAS the Quality
+    Score — so reading it as a moat would show the quality number twice.
+    New snapshots always carry "quality_score", so its presence is the
+    marker: no "quality_score" key means no real Moat Score yet (the
+    snapshot rebuilds with the new code when its 24h cache expires).
+    """
+    if "quality_score" not in snapshot:
+        return None
+    return snapshot.get("moat_score")
 from storage import (
     ACCOUNT_TYPES,
     MANUAL_SECTOR_OPTIONS,
@@ -1083,7 +1097,7 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
         st.markdown(render_metric_box("Action", action.replace("_", " "), ACTION_COLOR_CLASS.get(action, "metric-neutral")), unsafe_allow_html=True)
 
     st.markdown(f"**Quality Score:** {quality_score(snap)} / 100")
-    _moat = snap.get("moat_score")
+    _moat = moat_score(snap)
     _moat_missing = ((snap.get("gatekeeper") or {}).get("moat_detail") or {}).get("missing") or []
     _moat_labels = {"roic": "ROIC history", "gross_margin": "gross margin",
                     "revenue_stability": "revenue history", "operating_margin_stability": "operating margin"}
@@ -1772,7 +1786,7 @@ with tab_lookup:
                 ("Growth Used", lambda s, v: "—" if v is None or v.get("growth_used") is None else f"{v['growth_used']:.1%}"),
                 ("Historical P/E", lambda s, v: "—" if s.get("historical_pe") is None else f"{s['historical_pe']:.1f}"),
                 ("Quality Score", lambda s, v: str(quality_score(s))),
-                ("Moat Score", lambda s, v: "—" if s.get("moat_score") is None else str(s.get("moat_score"))),
+                ("Moat Score", lambda s, v: "—" if moat_score(s) is None else str(moat_score(s))),
                 ("Big Five passes", lambda s, v: f"{big_five_pass_count(s, 0.10)}/5"),
                 ("Dividend streak (yrs)", lambda s, v: str(s.get("dividend_streak") or 0)),
                 ("Dividend yield", lambda s, v: _pct_or_dash(s.get("dividend_yield"))),
@@ -2149,7 +2163,7 @@ with tab_portfolio:
                     "Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": money(h["avg_cost"]), "Price": money(price),
                     "Value": money(value), "Gain/Loss": money(gain),
                     "Gain %": "\u2014" if gain_pct is None else f"{gain_pct:+.1f}%",
-                    "Sticker": money(val["sticker_price"]), "Quality": quality_score(snap), "Moat": snap.get("moat_score"),
+                    "Sticker": money(val["sticker_price"]), "Quality": quality_score(snap), "Moat": "—" if moat_score(snap) is None else moat_score(snap),
                     "Meaning": note_pf.get("meaning") or "\u2014", "Moat type": note_pf.get("moat_type") or "\u2014",
                     "Weight": "\u2014", "Target %": "\u2014" if h.get("target_pct") is None else f"{h['target_pct']:.1f}%", "Drift": "\u2014",
                     "Div Income/yr": money(div_income) + dps_label if div_income is not None else "\u2014",
@@ -2166,7 +2180,7 @@ with tab_portfolio:
                     "Est Tax": "\u2014" if est_tax_pf is None else money(est_tax_pf),
                     "Signal": sig["signal"], "Lean": lean_pf, "Why": why_short_pf,
                     "_rank": PORTFOLIO_RANK.get(sig["signal"], 9),
-                    "_value": value or 0.0, "_quality": quality_score(snap) or 0.0, "_moat": snap.get("moat_score") or 0.0, "_target": h.get("target_pct"),
+                    "_value": value or 0.0, "_quality": quality_score(snap) or 0.0, "_moat": moat_score(snap), "_target": h.get("target_pct"),
                     "_ticker_for_log": h["ticker"], "_price_for_log": price, "_sticker_for_log": val["sticker_price"],
                     "_gain": gain, "_term": tax_info_pf["term"], "_shares": h["shares"], "_avg_cost": h["avg_cost"],
                     "_div_income": div_income or 0.0,
@@ -2562,7 +2576,7 @@ with tab_watchlist:
                     "Sticker": money(val["sticker_price"]),
                     "Buy Below": money(val["margin_of_safety_price"]),
                     "% Above Buy Price": "\u2014" if pct is None else f"{pct:+.1f}%",
-                    "Quality": quality_score(snap), "Moat": snap.get("moat_score"),
+                    "Quality": quality_score(snap), "Moat": "—" if moat_score(snap) is None else moat_score(snap),
                     "Mkt Cap": _format_market_cap(_market_cap(snap)),
                     "PEG": "\u2014" if peg_w is None else f"{peg_w:.2f}",
                     "Owner Yield": "\u2014" if oey_w is None else f"{oey_w:.1%}",
@@ -2714,7 +2728,7 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_quali
                 "#": i, "Ticker": r["ticker"], "Company": r["name"] or "", "Price": money(r["current_price"]),
                 "Sticker": money(r["sticker_price"]), "MOS Price": money(r["margin_of_safety_price"]),
                 "% Below Sticker": f"{r['undervalued_pct']:.1f}%", "Growth Used": f"{r['growth_used']:.1%}",
-                "Quality": r["quality_score"], "Moat": r["moat_score"], "Big Five": f"{r.get('big_five_passes', 0)}/5",
+                "Quality": r["quality_score"], "Moat": "—" if r["moat_score"] is None else r["moat_score"], "Big Five": f"{r.get('big_five_passes', 0)}/5",
                 "Meaning": note_scan.get("meaning") or "\u2014", "Moat type": note_scan.get("moat_type") or "\u2014",
                 "Action": r["action"].replace("_", " "), "Div. Streak (yrs)": r["dividend_streak"],
                 "Mkt Cap": _format_market_cap(_market_cap(snap_row)) if snap_row else "\u2014",
