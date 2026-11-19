@@ -90,6 +90,10 @@ TAG_CANDIDATES: Dict[str, List[str]] = {
     "Net_Income": ["NetIncomeLoss", "ProfitLoss"],
     "EPS": ["EarningsPerShareDiluted", "EarningsPerShareBasicAndDiluted"],
     "Sales": ["Revenues", "SalesRevenueNet", "RevenueFromContractWithCustomerExcludingAssessedTax"],
+    # Gross profit feeds the Moat Score (gross-margin level + stability).
+    # It is a plain duration metric like Sales — same payload, no extra
+    # SEC call.
+    "Gross_Profit": ["GrossProfit"],
     "Operating_Cash_Flow": ["NetCashProvidedByUsedInOperatingActivities"],
     "Cap_Ex": [
         "PaymentsToAcquirePropertyPlantAndEquipment",
@@ -120,7 +124,7 @@ TAG_CANDIDATES: Dict[str, List[str]] = {
         "CommonStockDividendsPerShareDeclared",
         "CommonStockDividendsPerShareCashPaid",
     ],
-    # Display-only accuracy metrics (never feed the Sticker, Moat, or a
+    # Display-only accuracy metrics (never feed the Sticker, Quality, or a
     # signal): stock-based compensation, interest expense, operating
     # income. SBC is the cash-flow add-back tag most filers report.
     "Share_Based_Compensation": [
@@ -135,6 +139,7 @@ METRIC_UNIT: Dict[str, str] = {
     "Net_Income": "USD",
     "EPS": "USD/shares",
     "Sales": "USD",
+    "Gross_Profit": "USD",
     "Operating_Cash_Flow": "USD",
     "Cap_Ex": "USD",
     "Depreciation_Amortization": "USD",
@@ -153,6 +158,7 @@ DURATION_METRICS = {
     "Net_Income",
     "EPS",
     "Sales",
+    "Gross_Profit",
     "Operating_Cash_Flow",
     "Cap_Ex",
     "Depreciation_Amortization",
@@ -405,7 +411,7 @@ def _get_best_tag_series_with_tag(
     tag with any data. That silently truncated history when the first
     tag only exists for recent years — e.g. AAPL Sales under "Revenues"
     exists only from ~2015, while "SalesRevenueNet" has the full history,
-    so early Sales horizons looked missing and Big Five passes / Moat
+    so early Sales horizons looked missing and Big Five passes / Quality
     were understated. Now every candidate tag's full series is built,
     tags are ranked by coverage (most fiscal year-ends, then latest end,
     then candidate order), and values are merged date-by-date with the
@@ -578,7 +584,7 @@ def _build_financial_history(
     # Non-positive invested capital (e.g. buyback-driven negative equity at
     # MCD/SBUX) makes ROIC meaningless, so those horizons are dropped —
     # but they are now RECORDED in _roic_dropped instead of vanishing
-    # silently, so the UI can say why ROIC (and the Moat points it feeds)
+    # silently, so the UI can say why ROIC (and the Quality points it feeds)
     # is missing for those horizons.
     roic: Dict[int, float] = {}
     roic_dropped: Dict[int, str] = {}
@@ -598,7 +604,7 @@ def _build_financial_history(
 
     equity_per_share = _combine_horizon_dicts(equity, shares, lambda a, b: a / b if b else None)
 
-    # Display-only accuracy metrics (never feed the Sticker, Moat, or a
+    # Display-only accuracy metrics (never feed the Sticker, Quality, or a
     # signal). SBC-adjusted FCF subtracts stock-based compensation from
     # free cash flow — SBC is a real cost to owners (dilution), even
     # though it never leaves as cash. Interest coverage is operating
@@ -682,7 +688,10 @@ def _build_financial_history(
         "Net_Income": {0: net_income[0]} if 0 in net_income else {},
         "Share_Based_Compensation": {0: sbc[0]} if 0 in sbc else {},
         "Interest_Expense": {0: interest[0]} if 0 in interest else {},
-        "Operating_Income": {0: op_income[0]} if 0 in op_income else {},
+        # Full horizon dicts (not just year 0): the Moat Score reads
+        # gross/operating margins across horizons for level + stability.
+        "Gross_Profit": by_horizon["Gross_Profit"],
+        "Operating_Income": op_income,
         "SBC_Adjusted_FCF": {0: sbc_adjusted_fcf[0]} if 0 in sbc_adjusted_fcf else {},
         "Total_Debt": {0: total_debt[0]} if 0 in total_debt else {},
         "_sbc_adjusted_fcf_history": sbc_adjusted_fcf,

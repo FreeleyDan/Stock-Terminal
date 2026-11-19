@@ -165,10 +165,10 @@ def _error(ticker: str, message: str, kind: str) -> Dict[str, Any]:
 
 def _fund_snapshot(ticker: str) -> Tuple[Dict[str, Any], Optional[str]]:
     """Yahoo-only snapshot for a fund/ETF the SEC has no 10-K for: price
-    and trailing-12-month distributions. No Sticker, Moat, or signal —
-    the snapshot says so (is_fund), and every consumer must check it
-    before touching stock-only fields. Returns (snapshot, where_to_cache)
-    like _evaluate."""
+    and trailing-12-month distributions. No Sticker, Quality Score, or
+    signal — the snapshot says so (is_fund), and every consumer must
+    check it before touching stock-only fields. Returns (snapshot,
+    where_to_cache) like _evaluate."""
     bundle, pstatus = get_price_history(ticker)
     if bundle is None:
         if pstatus == "empty":
@@ -188,6 +188,7 @@ def _fund_snapshot(ticker: str) -> Tuple[Dict[str, Any], Optional[str]]:
         "current_eps": None,
         "growth_rate": None,
         "historical_pe": None,
+        "quality_score": None,
         "moat_score": None,
         "gatekeeper": None,
         "dividend_streak": 0,
@@ -301,7 +302,13 @@ def _evaluate(ticker: str, prune_unvaluable: bool) -> Tuple[Dict[str, Any], Opti
         "current_eps": current_eps,
         "growth_rate": growth_rate,
         "historical_pe": hist_pe,
-        "moat_score": gatekeeper["moat_score"],
+        # Quality Score is the renamed 80/10/10 Big Five + Debt + CapEx
+        # score; Moat Score is the separate competitive-moat footprint.
+        # Old gatekeeper dicts (pre-rename) carry only "moat_score" and
+        # it WAS the quality score — map it, and leave moat None rather
+        # than reading the old value as a moat score.
+        "quality_score": gatekeeper.get("quality_score", gatekeeper.get("moat_score")),
+        "moat_score": gatekeeper.get("moat_score") if "quality_score" in gatekeeper else None,
         "gatekeeper": gatekeeper,
         "dividend_streak": streak,
         "split_count": len(bundle["splits"]),

@@ -40,7 +40,7 @@ except ImportError:  # deployed calculations.py can lag the repo behind app.py
         Local copy of calculations.median_yoy_growth, used only when the
         deployed calculations.py predates it — so a stale deploy can never
         break app startup again. Display only: it never feeds the Sticker,
-        Moat, or a signal.
+        Quality Score, or a signal.
         """
         try:
             dated: List[tuple] = []
@@ -64,6 +64,22 @@ from holdings import NON_13F, check_holdings
 from gatekeeper import BIG_FIVE_METRICS, HORIZONS
 from screener import big_five_pass_count, dividend_safety_score, rank_snapshots, scan_snapshots, stepped_rank_snapshots
 from signals import BUY_RANK, PORTFOLIO_RANK, buy_signal, portfolio_signal, sell_signal
+
+try:
+    from signals import quality_score
+except ImportError:  # deployed signals.py can lag the repo behind app.py
+    def quality_score(snapshot: Dict[str, Any]) -> float:
+        """
+        Local copy of signals.quality_score, used only when the deployed
+        signals.py predates it — so a stale deploy can never break app
+        startup again. Same fallback rule: "quality_score" when present,
+        else the pre-rename "moat_score" (which WAS the quality score).
+        """
+        if "quality_score" in snapshot:
+            q = snapshot.get("quality_score")
+            return q if q is not None else 0.0
+        q = snapshot.get("moat_score")
+        return q if q is not None else 0.0
 from storage import (
     ACCOUNT_TYPES,
     MANUAL_SECTOR_OPTIONS,
@@ -163,7 +179,7 @@ ACTION_COLOR_CLASS = {
 SIGNAL_COLORS = {
     "BUY": "#2e7d32",
     "NEAR BUY": "#b98600",
-    "CHEAP, WEAK MOAT": "#b98600",
+    "CHEAP, WEAK QUALITY": "#b98600",
     "SELL": "#c62828",
     "REVIEW": "#b98600",
     "HOLD": "#2e7d32",
@@ -388,9 +404,9 @@ def _deterioration_flags(snap: Dict[str, Any]) -> List[str]:
 def _data_completeness(gatekeeper: Dict[str, Any]) -> Dict[str, Any]:
     """
     How much Big Five history is actually determined, vs "not yet
-    determined" (missing history). The Moat Score excludes undetermined
-    horizons from its denominator, so a thin-data moat can look like a
-    thick-data moat without this check.
+    determined" (missing history). The Quality Score excludes undetermined
+    horizons from its denominator, so a thin-data quality can look like a
+    thick-data quality without this check.
     Returns {"metrics": n/5 with >=1 determined horizon,
              "horizons": n/20 determined horizon checks,
              "missing_metrics": [display names with no determined horizon]}.
@@ -478,6 +494,12 @@ def _storage_status_line(last_saved: Optional[str] = None) -> str:
         if last_saved:
             return f"Saved to Google Sheets: {last_saved}. Survives restarts."
         return "Saved to Google Sheets — survives restarts."
+    if _backend == "sheets-guard":
+        # The guard refused a save that looked wiped (no holdings,
+        # watchlists, notes, manual data, sales, or signal log) while the
+        # Sheet still holds data — nothing was overwritten. Reloading
+        # re-reads the good Sheet data.
+        return "Save blocked — the app tried to save an empty state over your saved data, so nothing was overwritten. Reload the page."
     if _backend == "sheets-unavailable":
         if last_saved:
             return f"Google Sheets is unreachable — saving locally (last save {last_saved}), will sync when it's back."
@@ -1031,7 +1053,7 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
         return
     if snap.get("is_fund"):
         # Funds: price and distributions from Yahoo only — no Sticker,
-        # Moat, checklist, or signal. The add controls still apply.
+        # Quality Score, checklist, or signal. The add controls still apply.
         _fcols = st.columns(3)
         with _fcols[0]:
             st.markdown(render_metric_box("Current Price", money(snap["current_price"]), "metric-neutral"), unsafe_allow_html=True)
@@ -1041,7 +1063,7 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
             _fy = snap.get("dividend_yield")
             st.markdown(render_metric_box("Yield (TTM)", "—" if _fy is None else f"{_fy:.1%}", "metric-neutral"), unsafe_allow_html=True)
         st.caption(
-            "Fund — no Sticker Price, Moat, or signal. The SEC has no 10-K for this ticker, so price and "
+            "Fund — no Sticker Price, Quality Score, or signal. The SEC has no 10-K for this ticker, so price and "
             f"distributions come from Yahoo (last close {snap.get('price_date', '')})."
         )
         _card_add_controls(ticker)
@@ -1060,7 +1082,15 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
         action = val["action"]
         st.markdown(render_metric_box("Action", action.replace("_", " "), ACTION_COLOR_CLASS.get(action, "metric-neutral")), unsafe_allow_html=True)
 
-    st.markdown(f"**Moat Score:** {snap['moat_score']} / 100")
+    st.markdown(f"**Quality Score:** {quality_score(snap)} / 100")
+    _moat = snap.get("moat_score")
+    _moat_missing = ((snap.get("gatekeeper") or {}).get("moat_detail") or {}).get("missing") or []
+    _moat_labels = {"roic": "ROIC history", "gross_margin": "gross margin",
+                    "revenue_stability": "revenue history", "operating_margin_stability": "operating margin"}
+    _moat_txt = "—" if _moat is None else f"{_moat} / 100" + (" *" if _moat_missing else "")
+    st.markdown(f"**Moat Score:** {_moat_txt}")
+    if _moat_missing:
+        st.caption("Moat Score * — missing: " + ", ".join(_moat_labels.get(m, m) for m in _moat_missing) + ". Those parts score 0, so the score is a floor, not a verdict.")
     comp = _data_completeness(snap["gatekeeper"])
     st.caption(
         f"Data completeness: {comp['metrics']}/5 Big Five metrics with determined history "
@@ -1069,11 +1099,11 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
     )
     if comp["metrics"] <= 3:
         st.warning(
-            "Thin data — this Moat Score is based on limited history. Treat it with less confidence "
+            "Thin data — this Quality Score is based on limited history. Treat it with less confidence "
             "than a score with 5/5 metrics determined."
         )
     # ROIC dropouts, no longer silent: if ROIC is missing for a horizon,
-    # say why — a capped Moat is not the same as a bad business.
+    # say why — a capped Quality Score is not the same as a bad business.
     roic_dropped = snap.get("roic_dropped") or {}
     if roic_dropped:
         def _roic_year_label(y: Any) -> str:
@@ -1085,7 +1115,7 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
         st.warning(
             "ROIC not computed for: "
             + "; ".join(f"{_roic_year_label(y)} — {reason}" for y, reason in sorted(roic_dropped.items(), key=lambda kv: str(kv[0])))
-            + ". Those horizons contribute no ROIC to the Big Five / Moat, which caps the score — it does not mean ROIC is low."
+            + ". Those horizons contribute no ROIC to the Big Five / Quality, which caps the score — it does not mean ROIC is low."
         )
     details = [f"Last close {snap.get('price_date', '')}"]
     if val["growth_used"] is not None:
@@ -1238,7 +1268,7 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
                      "10-yr CAGR": "\u2014" if _ar["cagr10"] is None else f"{_ar['cagr10']:.1%}"}
                 )
             st.dataframe(pd.DataFrame(_a_rows, columns=_a_cols), hide_index=True, use_container_width=True)
-            st.caption("CAGR is end-to-end — one bad base year flatters it; median YoY is the typical year's growth. When they disagree, look at the yearly values. Display only — nothing here changes the Sticker, Moat, or any signal.")
+            st.caption("CAGR is end-to-end — one bad base year flatters it; median YoY is the typical year's growth. When they disagree, look at the yearly values. Display only — nothing here changes the Sticker, Quality Score, or any signal.")
 
     # Buffett notes: Meaning / circle of competence, moat type,
     # Management, thesis, and sell trigger. XBRL cannot see these.
@@ -1460,11 +1490,11 @@ with tab_dashboard:
         st.info("Nothing to summarize yet — add a holding on the Portfolio tab or a ticker on the Watchlist tab.")
     else:
         _approach = float(st.session_state.get("pf_approach", 10))
-        _min_moat_hold = float(st.session_state.get("pf_moat", 40))
+        _min_quality_hold = float(st.session_state.get("pf_moat", 40))
         _max_loss = float(st.session_state.get("pf_loss", 0))
-        _min_moat_buy_pf = float(st.session_state.get("pf_buy_moat", 60))
+        _min_quality_buy_pf = float(st.session_state.get("pf_buy_moat", 60))
         _near_buy_pf = float(st.session_state.get("pf_near", 15))
-        _min_moat_wl = float(st.session_state.get("wl_moat", 60))
+        _min_quality_wl = float(st.session_state.get("wl_moat", 60))
         _near_buy_wl = float(st.session_state.get("wl_near", 15))
         _dash_value = _dash_cost = _dash_div = _dash_cash_total = 0.0
         _pf_counts: Counter = Counter()
@@ -1495,8 +1525,8 @@ with tab_dashboard:
                     else:
                         _val = valuation_from_snapshot(_snap, discount_rate, max_growth)
                         _sig = portfolio_signal(
-                            _snap, _val, _h.get("avg_cost"), _approach, _min_moat_hold, _max_loss,
-                            _min_moat_buy_pf, _near_buy_pf,
+                            _snap, _val, _h.get("avg_cost"), _approach, _min_quality_hold, _max_loss,
+                            _min_quality_buy_pf, _near_buy_pf,
                         )
                         _pf_counts[_sig["signal"]] += 1
                         _pf_sig_counts[_sig["signal"]] += 1
@@ -1594,7 +1624,7 @@ with tab_dashboard:
                     if _snap.get("price_date"):
                         _dash_price_dates.append(_snap["price_date"])
                     _val = valuation_from_snapshot(_snap, discount_rate, max_growth)
-                    _sig = buy_signal(_snap, _val, _min_moat_wl, _near_buy_wl)
+                    _sig = buy_signal(_snap, _val, _min_quality_wl, _near_buy_wl)
                     _wl_counts[_sig["signal"]] += 1
                     if _sig["signal"] in ("BUY", "NEAR BUY"):
                         _attention.append({
@@ -1741,7 +1771,8 @@ with tab_lookup:
                 ("% Below Sticker", lambda s, v: "—" if v is None or v.get("undervalued_pct") is None else f"{v['undervalued_pct']:.1f}%"),
                 ("Growth Used", lambda s, v: "—" if v is None or v.get("growth_used") is None else f"{v['growth_used']:.1%}"),
                 ("Historical P/E", lambda s, v: "—" if s.get("historical_pe") is None else f"{s['historical_pe']:.1f}"),
-                ("Moat Score", lambda s, v: str(s.get("moat_score"))),
+                ("Quality Score", lambda s, v: str(quality_score(s))),
+                ("Moat Score", lambda s, v: "—" if s.get("moat_score") is None else str(s.get("moat_score"))),
                 ("Big Five passes", lambda s, v: f"{big_five_pass_count(s, 0.10)}/5"),
                 ("Dividend streak (yrs)", lambda s, v: str(s.get("dividend_streak") or 0)),
                 ("Dividend yield", lambda s, v: _pct_or_dash(s.get("dividend_yield"))),
@@ -1749,7 +1780,7 @@ with tab_lookup:
                 ("Market cap", lambda s, v: _format_market_cap(_market_cap(s))),
                 ("PEG", lambda s, v: "—" if _peg_ratio(s) is None else f"{_peg_ratio(s):.2f}"),
                 ("Owner earnings yield", lambda s, v: "—" if _owner_earnings_yield(s) is None else f"{_owner_earnings_yield(s):.1%}"),
-                ("Signal (Moat ≥60, near-buy 15%)", lambda s, v: buy_signal(s, v, 60.0, 15.0)["signal"] if v else "—"),
+                ("Signal (Quality ≥60, near-buy 15%)", lambda s, v: buy_signal(s, v, 60.0, 15.0)["signal"] if v else "—"),
             ]:
                 row: Dict[str, Any] = {"Metric": label}
                 for t in compare_picks:
@@ -1758,7 +1789,7 @@ with tab_lookup:
                     row[t] = fmt(s, v)
                 compare_rows.append(row)
             st.dataframe(pd.DataFrame(compare_rows), hide_index=True, use_container_width=True)
-            st.caption("Signal uses the watchlist defaults (Moat ≥60, near-buy band 15%) for all tickers, so the comparison is apples-to-apples.")
+            st.caption("Signal uses the watchlist defaults (Quality ≥60, near-buy band 15%) for all tickers, so the comparison is apples-to-apples.")
         elif compare_picks:
             st.info("Pick at least 2 tickers to compare.")
 
@@ -1793,12 +1824,12 @@ with tab_portfolio:
     with c1:
         approach_pct = st.slider("Flag when within X% of Sticker Price", 0, 30, 10, key="pf_approach")
     with c2:
-        min_moat_hold = st.slider("Flag when Moat Score is below", 0, 100, 40, key="pf_moat")
+        min_quality_hold = st.slider("Flag when Quality Score is below", 0, 100, 40, key="pf_moat")
     with c3:
         max_loss_pct = st.number_input("Flag when down more than X% vs cost (0 = off)", 0, 90, 0, key="pf_loss")
     c4, c5 = st.columns(2)
     with c4:
-        min_moat_buy_pf = st.slider("Minimum Moat Score to call it a BUY (add)", 0, 100, 60, key="pf_buy_moat")
+        min_quality_buy_pf = st.slider("Minimum Quality Score to call it a BUY (add)", 0, 100, 60, key="pf_buy_moat")
     with c5:
         near_buy_pct_pf = st.slider("'Near buy' band: within X% above the buy price", 0, 50, 15, key="pf_near")
 
@@ -1941,20 +1972,20 @@ with tab_portfolio:
                 snap = build_snapshot(h["ticker"], price_max_age=TRACKING_PRICE_MAX_AGE)
                 if snap.get("error"):
                     rows.append({"Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": money(h["avg_cost"]), "Price": "\u2014",
-                                 "Value": "\u2014", "Gain/Loss": "\u2014", "Gain %": "\u2014", "Sticker": "\u2014", "Moat": "\u2014",
+                                 "Value": "\u2014", "Gain/Loss": "\u2014", "Gain %": "\u2014", "Sticker": "\u2014", "Quality": "\u2014", "Moat": "\u2014",
                                  "Meaning": "\u2014", "Moat type": "\u2014", "Weight": "\u2014", "Target %": "\u2014", "Drift": "\u2014",
                                  "Div Income/yr": "\u2014",
                                  "% of Div Income": "\u2014",
                                  "Yield on Cost": "\u2014", "Flags": "\u2014", "Mkt Cap": "\u2014", "PEG": "\u2014",
                                  "Owner Yield": "\u2014", "Data": "\u2014", "Last FY End": "\u2014", "Tax Term": "\u2014", "Days to LT": "\u2014", "Est Tax": "\u2014",
-                                 "Signal": "NO DATA", "Lean": "\u2014", "Why": _short_why(snap["error"]), "_rank": 9, "_value": 0.0, "_moat": 0.0})
+                                 "Signal": "NO DATA", "Lean": "\u2014", "Why": _short_why(snap["error"]), "_rank": 9, "_value": 0.0, "_quality": 0.0, "_moat": 0.0})
                     review_items.append({"Ticker": h["ticker"], "Signal": "NO DATA", "Lean": "\u2014", "Reason": snap["error"], "_urgency": 0})
                     continue
                 if snap.get("is_fund"):
                     # Funds: price, value, gain/loss, and dividend income
-                    # from Yahoo — no Sticker, Moat, or signal, and no
-                    # signal-log entry. _moat is None (not 0) so the
-                    # weighted Moat below counts stocks only.
+                    # from Yahoo — no Sticker, Quality Score, or signal, and no
+                    # signal-log entry. _quality/_moat are None (not 0) so the
+                    # weighted scores below count stocks only.
                     if snap.get("price_date"):
                         portfolio_price_dates.append(snap["price_date"])
                     price_f = snap["current_price"]
@@ -1984,7 +2015,7 @@ with tab_portfolio:
                         "Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": money(h["avg_cost"]), "Price": money(price_f),
                         "Value": money(value_f), "Gain/Loss": money(gain_f),
                         "Gain %": "—" if gain_pct_f is None else f"{gain_pct_f:+.1f}%",
-                        "Sticker": "—", "Moat": "—",
+                        "Sticker": "—", "Quality": "—", "Moat": "—",
                         "Meaning": "Fund", "Moat type": "—",
                         "Weight": "—", "Target %": "—" if h.get("target_pct") is None else f"{h['target_pct']:.1f}%", "Drift": "—",
                         "Div Income/yr": money(div_income_f) + dps_label_f if div_income_f is not None else "—",
@@ -2000,7 +2031,7 @@ with tab_portfolio:
                         "Est Tax": "—" if est_tax_f is None else money(est_tax_f),
                         "Signal": "FUND", "Lean": "—", "Why": "Fund — no Sticker or signal",
                         "_rank": 9,
-                        "_value": value_f or 0.0, "_moat": None, "_target": h.get("target_pct"),
+                        "_value": value_f or 0.0, "_quality": None, "_moat": None, "_target": h.get("target_pct"),
                         "_ticker_for_log": None, "_price_for_log": None, "_sticker_for_log": None,
                         "_gain": gain_f, "_term": tax_info_f["term"], "_shares": h["shares"], "_avg_cost": h["avg_cost"],
                         "_div_income": div_income_f or 0.0,
@@ -2010,8 +2041,8 @@ with tab_portfolio:
                 if snap.get("price_date"):
                     portfolio_price_dates.append(snap["price_date"])
                 sig = portfolio_signal(
-                    snap, val, h["avg_cost"], approach_pct, min_moat_hold, float(max_loss_pct),
-                    min_moat_buy_pf, float(near_buy_pct_pf),
+                    snap, val, h["avg_cost"], approach_pct, min_quality_hold, float(max_loss_pct),
+                    min_quality_buy_pf, float(near_buy_pct_pf),
                 )
                 note_pf = _notes_for(h["ticker"])
                 price = snap["current_price"]
@@ -2118,7 +2149,7 @@ with tab_portfolio:
                     "Ticker": h["ticker"], "Shares": h["shares"], "Avg Cost": money(h["avg_cost"]), "Price": money(price),
                     "Value": money(value), "Gain/Loss": money(gain),
                     "Gain %": "\u2014" if gain_pct is None else f"{gain_pct:+.1f}%",
-                    "Sticker": money(val["sticker_price"]), "Moat": snap["moat_score"],
+                    "Sticker": money(val["sticker_price"]), "Quality": quality_score(snap), "Moat": snap.get("moat_score"),
                     "Meaning": note_pf.get("meaning") or "\u2014", "Moat type": note_pf.get("moat_type") or "\u2014",
                     "Weight": "\u2014", "Target %": "\u2014" if h.get("target_pct") is None else f"{h['target_pct']:.1f}%", "Drift": "\u2014",
                     "Div Income/yr": money(div_income) + dps_label if div_income is not None else "\u2014",
@@ -2135,7 +2166,7 @@ with tab_portfolio:
                     "Est Tax": "\u2014" if est_tax_pf is None else money(est_tax_pf),
                     "Signal": sig["signal"], "Lean": lean_pf, "Why": why_short_pf,
                     "_rank": PORTFOLIO_RANK.get(sig["signal"], 9),
-                    "_value": value or 0.0, "_moat": snap["moat_score"] or 0.0, "_target": h.get("target_pct"),
+                    "_value": value or 0.0, "_quality": quality_score(snap) or 0.0, "_moat": snap.get("moat_score") or 0.0, "_target": h.get("target_pct"),
                     "_ticker_for_log": h["ticker"], "_price_for_log": price, "_sticker_for_log": val["sticker_price"],
                     "_gain": gain, "_term": tax_info_pf["term"], "_shares": h["shares"], "_avg_cost": h["avg_cost"],
                     "_div_income": div_income or 0.0,
@@ -2151,6 +2182,9 @@ with tab_portfolio:
         for r in rows:
             if total_div_income > 0 and r.get("_div_income"):
                 r["% of Div Income"] = f"{r['_div_income'] / total_div_income:.1%}"
+        _quality_rows = [r for r in rows if r.get("_quality") is not None]
+        _quality_value = sum(r["_value"] for r in _quality_rows)
+        weighted_quality = (sum(r["_value"] * r["_quality"] for r in _quality_rows) / _quality_value) if _quality_value > 0 else None
         _moat_rows = [r for r in rows if r.get("_moat") is not None]
         _moat_value = sum(r["_value"] for r in _moat_rows)
         weighted_moat = (sum(r["_value"] * r["_moat"] for r in _moat_rows) / _moat_value) if _moat_value > 0 else None
@@ -2174,7 +2208,7 @@ with tab_portfolio:
             st.dataframe(pd.DataFrame(review_items).drop(columns=["_urgency"]), hide_index=True, use_container_width=True)
         else:
             st.caption("Review queue: no holdings need attention right now.")
-        df = pd.DataFrame(rows).drop(columns=["_rank", "_value", "_moat", "_target", "_ticker_for_log", "_price_for_log", "_sticker_for_log", "_gain", "_term", "_shares", "_avg_cost", "_div_income"])
+        df = pd.DataFrame(rows).drop(columns=["_rank", "_value", "_quality", "_moat", "_target", "_ticker_for_log", "_price_for_log", "_sticker_for_log", "_gain", "_term", "_shares", "_avg_cost", "_div_income"])
         st.dataframe(style_signal_column(df), hide_index=True, use_container_width=True)
         as_of_pf = _prices_as_of_caption(portfolio_price_dates)
         if as_of_pf:
@@ -2203,8 +2237,10 @@ with tab_portfolio:
                 + (f" \u00b7 yield on cost {total_div_income / total_cost:.1%}" if total_cost > 0 else "")
                 + " \u00b7 holdings with no DPS show \u2014, not $0, so this total may understate income."
             )
+        if weighted_quality is not None:
+            st.markdown(f"**Weighted Quality Score:** {weighted_quality:.1f} / 100 (by stock position value — funds have no Quality Score)")
         if weighted_moat is not None:
-            st.markdown(f"**Weighted Moat Score:** {weighted_moat:.1f} / 100 (by stock position value — funds have no Moat)")
+            st.markdown(f"**Weighted Moat Score:** {weighted_moat:.1f} / 100 (by stock position value — funds have no Moat Score)")
         if largest is not None and total_account > 0 and largest["_value"]:
             st.markdown(f"**Largest holding:** {largest['Ticker']} at {largest['_value'] / total_account:.1%} of account value")
         # Dividend income projection, if growth continues at the 5-year
@@ -2417,7 +2453,7 @@ with tab_watchlist:
     )
     w1, w2 = st.columns(2)
     with w1:
-        min_moat_buy = st.slider("Minimum Moat Score to call it a BUY", 0, 100, 60, key="wl_moat")
+        min_quality_buy = st.slider("Minimum Quality Score to call it a BUY", 0, 100, 60, key="wl_moat")
     with w2:
         near_buy_pct = st.slider("'Near buy' band: within X% above the buy price", 0, 50, 15, key="wl_near")
 
@@ -2491,12 +2527,12 @@ with tab_watchlist:
                 snap = build_snapshot(t, price_max_age=TRACKING_PRICE_MAX_AGE)
                 if snap.get("error"):
                     rows.append({"Ticker": t, "Price": "\u2014", "Yield": "\u2014", "Sticker": "\u2014", "Buy Below": "\u2014", "% Above Buy Price": "\u2014",
-                                 "Moat": "\u2014", "Mkt Cap": "\u2014", "PEG": "\u2014", "Owner Yield": "\u2014", "Data": "\u2014", "Flags": "\u2014",
+                                 "Quality": "\u2014", "Moat": "\u2014", "Mkt Cap": "\u2014", "PEG": "\u2014", "Owner Yield": "\u2014", "Data": "\u2014", "Flags": "\u2014",
                                  "Signal": "NO DATA", "Why": _short_why(snap["error"]), "_rank": 9, "_pct": 1e9})
                     continue
                 if snap.get("is_fund"):
                     # Funds: price and TTM yield from Yahoo — no Sticker,
-                    # Moat, or signal.
+                    # Quality Score, or signal.
                     if snap.get("price_date"):
                         watch_price_dates.append(snap["price_date"])
                     _fy_w = snap.get("dividend_yield")
@@ -2505,13 +2541,13 @@ with tab_watchlist:
                         "Ticker": t, "Price": money(snap["current_price"]),
                         "Yield": "—" if _fy_w is None else f"{_fy_w:.1%}",
                         "Sticker": "—", "Buy Below": "—", "% Above Buy Price": "—",
-                        "Moat": "—", "Mkt Cap": "—", "PEG": "—", "Owner Yield": "—", "Data": "—", "Flags": "—",
+                        "Quality": "—", "Moat": "—", "Mkt Cap": "—", "PEG": "—", "Owner Yield": "—", "Data": "—", "Flags": "—",
                         "Signal": "FUND", "Why": "Fund — no Sticker or signal",
                         "_rank": 9, "_pct": 1e9,
                     })
                     continue
                 val = valuation_from_snapshot(snap, discount_rate, max_growth)
-                sig = buy_signal(snap, val, float(min_moat_buy), float(near_buy_pct))
+                sig = buy_signal(snap, val, float(min_quality_buy), float(near_buy_pct))
                 pct = sig["pct_above_buy"]
                 comp_w = _data_completeness(snap["gatekeeper"])
                 peg_w = _peg_ratio(snap)
@@ -2526,7 +2562,7 @@ with tab_watchlist:
                     "Sticker": money(val["sticker_price"]),
                     "Buy Below": money(val["margin_of_safety_price"]),
                     "% Above Buy Price": "\u2014" if pct is None else f"{pct:+.1f}%",
-                    "Moat": snap["moat_score"],
+                    "Quality": quality_score(snap), "Moat": snap.get("moat_score"),
                     "Mkt Cap": _format_market_cap(_market_cap(snap)),
                     "PEG": "\u2014" if peg_w is None else f"{peg_w:.2f}",
                     "Owner Yield": "\u2014" if oey_w is None else f"{oey_w:.1%}",
@@ -2572,7 +2608,7 @@ with tab_watchlist:
 
 
 # --- 4 & 5. Market scanner --------------------------------------------------
-def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat: float, quality_first: bool = True, download_key: str = "scan_csv", dividend_mode: bool = False, max_payout: Optional[float] = None, min_div_growth: Optional[float] = None, min_chowder: Optional[float] = None, min_market_cap_b: float = 0.0) -> None:
+def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_quality: float, quality_first: bool = True, download_key: str = "scan_csv", dividend_mode: bool = False, max_payout: Optional[float] = None, min_div_growth: Optional[float] = None, min_chowder: Optional[float] = None, min_market_cap_b: float = 0.0) -> None:
     # Dividend tab only (Miller / Van Knapp layer): filter snapshots
     # before ranking. A missing metric is shown as "—" and does NOT
     # exclude a stock — SEC dividend-per-share coverage is imperfect,
@@ -2620,7 +2656,7 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
         snapshots_for_rank = filtered
     if quality_first:
         stepped = stepped_rank_snapshots(
-            snapshots_for_rank, discount_rate, max_growth, min_dividend_years=min_dividend_years, min_moat_score=min_moat, top_n=25
+            snapshots_for_rank, discount_rate, max_growth, min_dividend_years=min_dividend_years, min_moat_score=min_quality, top_n=25
         )
         ranked = stepped["ranked"]
         hurdle_text = (
@@ -2632,9 +2668,9 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
         )
     else:
         ranked = rank_snapshots(
-            snapshots_for_rank, discount_rate, max_growth, min_dividend_years=min_dividend_years, min_moat_score=min_moat, top_n=25
+            snapshots_for_rank, discount_rate, max_growth, min_dividend_years=min_dividend_years, min_moat_score=min_quality, top_n=25
         )
-        hurdle_text = "Quality-first off — ranking by price alone (moat filter only)"
+        hurdle_text = "Quality-first off — ranking by price alone (quality filter only)"
     st.caption(
         f"{scan['label']}: scanned {scan['done']} of {scan['total']} tickers \u2014 {len(scan['snapshots'])} had usable "
         f"data, {ranked['valued_count']} could be valued, {ranked['matched_count']} match your filters. {hurdle_text}."
@@ -2646,7 +2682,7 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
             "at least 4% (Miller minimum), Chowder = yield + 5-year dividend growth (Van Knapp / Chowder rule, "
             "8%+ favored), and 10-by-10 = years for yield-on-cost to reach 10%. Van Knapp's full Quality Snapshots "
             "score uses paid data (Value Line, Morningstar moat, S&P ratings, Simply Safe Dividends) that SEC filings "
-            "don't carry, so this tab uses the app's Moat Score / Debt Test / free-cash-flow checks as its quality proxy, "
+            "don't carry, so this tab uses the app's Quality Score and Moat Score / Debt Test / free-cash-flow checks as its quality proxy, "
             "not his exact score. Stocks with a missing dividend metric show \u2014 and are not excluded for it. "
             "Safety Score is the app's own 0–100 score (payout/FCF cover 25, balance sheet 20, dividend history 20, "
             "dividend growth 20, earnings quality 15; 80+ Very Safe, 60+ Safe, 40+ Borderline, 20+ Unsafe). "
@@ -2678,7 +2714,7 @@ def render_ranked_table(scan: Dict[str, Any], min_dividend_years: int, min_moat:
                 "#": i, "Ticker": r["ticker"], "Company": r["name"] or "", "Price": money(r["current_price"]),
                 "Sticker": money(r["sticker_price"]), "MOS Price": money(r["margin_of_safety_price"]),
                 "% Below Sticker": f"{r['undervalued_pct']:.1f}%", "Growth Used": f"{r['growth_used']:.1%}",
-                "Moat": r["moat_score"], "Big Five": f"{r.get('big_five_passes', 0)}/5",
+                "Quality": r["quality_score"], "Moat": r["moat_score"], "Big Five": f"{r.get('big_five_passes', 0)}/5",
                 "Meaning": note_scan.get("meaning") or "\u2014", "Moat type": note_scan.get("moat_type") or "\u2014",
                 "Action": r["action"].replace("_", " "), "Div. Streak (yrs)": r["dividend_streak"],
                 "Mkt Cap": _format_market_cap(_market_cap(snap_row)) if snap_row else "\u2014",
@@ -2929,7 +2965,7 @@ with tab_undervalued:
         "Wonderful businesses first: require 4 of 5 Big Five at the hurdle, stepping down 1% from 10% to 5% if empty, SCHD fallback if still empty",
         value=True, key="scan_quality_first",
     )
-    min_moat_scan = st.slider("Minimum Moat Score (filter)", 0, 100, 0, key="scan_moat")
+    min_quality_scan = st.slider("Minimum Quality Score (filter)", 0, 100, 0, key="scan_moat")
     min_cap_scan = st.number_input("Minimum market cap ($ billions, 0 = no minimum; unknown cap does not exclude)", 0.0, 10000.0, 0.0, key="scan_mincap")
     # Saved filter presets (Undervalued tab only): selecting one
     # overrides the sliders above, so a favourite filter set is one
@@ -2939,7 +2975,7 @@ with tab_undervalued:
         uv_preset_name = st.selectbox("Preset (overrides sliders while selected)", ["(sliders)"] + list(uv_presets.keys()), key="uv_preset_sel")
         uv_new_name = st.text_input("Save current filters as preset", key="uv_preset_new").strip()
         if st.button("Save preset", key="uv_preset_save") and uv_new_name:
-            if save_scan_preset("undervalued", uv_new_name, {"quality_first": bool(quality_first_scan), "min_moat": float(min_moat_scan), "min_cap_b": float(min_cap_scan)}):
+            if save_scan_preset("undervalued", uv_new_name, {"quality_first": bool(quality_first_scan), "min_moat": float(min_quality_scan), "min_cap_b": float(min_cap_scan)}):
                 st.success(f"Saved preset '{uv_new_name}'.")
                 st.rerun()
         if uv_preset_name != "(sliders)" and st.button("Delete preset", key="uv_preset_del"):
@@ -2948,14 +2984,14 @@ with tab_undervalued:
     if uv_preset_name != "(sliders)":
         uv_p = uv_presets.get(uv_preset_name, {}) or {}
         quality_first_scan = bool(uv_p.get("quality_first", True))
-        min_moat_scan = float(uv_p.get("min_moat", 0))
+        min_quality_scan = float(uv_p.get("min_moat", 0))
         min_cap_scan = float(uv_p.get("min_cap_b", 0))
         st.caption(f"Using preset '{uv_preset_name}' — sliders are ignored until you switch back to (sliders).")
     if "scan" in st.session_state:
         _scan_view, _scan_note, _scan_filtered = _scan_for_universe(st.session_state["scan"], choice, custom_text)
         if _scan_note:
             st.caption(_scan_note)
-        ranked_now = render_ranked_table(_scan_view, 0, float(min_moat_scan), quality_first=quality_first_scan, download_key="scan_csv", min_market_cap_b=float(min_cap_scan))
+        ranked_now = render_ranked_table(_scan_view, 0, float(min_quality_scan), quality_first=quality_first_scan, download_key="scan_csv", min_market_cap_b=float(min_cap_scan))
         # Refresh the stored top 25 for the next scan's diff, then show
         # the diff against the previous scan (if this session has one).
         # No diff on a filtered view: it compares two different universes.
@@ -2973,7 +3009,7 @@ with tab_dividends:
         "10-criteria screener. The other tabs do not use Miller / Van Knapp."
     )
     div_years = st.slider("Minimum consecutive years of dividend growth (5+ required, 10+ preferred in your screener)", 1, 25, 5, key="div_years")
-    min_moat_div = st.slider("Minimum Moat Score (filter)", 0, 100, 0, key="div_moat")
+    min_quality_div = st.slider("Minimum Quality Score (filter)", 0, 100, 0, key="div_moat")
     max_payout_div = st.slider("Maximum payout ratio — DPS / EPS (your screener: generally under 65%; Miller: under 60% non-utilities)", 0, 100, 65, key="div_payout")
     min_div_growth_div = st.slider("Minimum 5-year dividend growth (Miller minimum: 4%)", 0, 20, 4, key="div_growth")
     min_chowder_div = st.slider("Minimum Chowder — yield + 5yr dividend growth (8%+ favored; 0 = show all, highlight in table)", 0, 15, 0, key="div_chowder")
@@ -2988,7 +3024,7 @@ with tab_dividends:
         div_new_name = st.text_input("Save current filters as preset", key="div_preset_new").strip()
         if st.button("Save preset", key="div_preset_save") and div_new_name:
             if save_scan_preset("dividend", div_new_name, {
-                "div_years": int(div_years), "min_moat": float(min_moat_div), "max_payout": float(max_payout_div),
+                "div_years": int(div_years), "min_moat": float(min_quality_div), "max_payout": float(max_payout_div),
                 "min_div_growth": float(min_div_growth_div), "min_chowder": float(min_chowder_div),
                 "min_cap_b": float(min_cap_div), "quality_first": bool(quality_first_div),
             }):
@@ -3000,7 +3036,7 @@ with tab_dividends:
     if div_preset_name != "(sliders)":
         dv_p = div_presets.get(div_preset_name, {}) or {}
         div_years = int(dv_p.get("div_years", 5))
-        min_moat_div = float(dv_p.get("min_moat", 0))
+        min_quality_div = float(dv_p.get("min_moat", 0))
         max_payout_div = float(dv_p.get("max_payout", 65))
         min_div_growth_div = float(dv_p.get("min_div_growth", 4))
         min_chowder_div = float(dv_p.get("min_chowder", 0))
@@ -3098,7 +3134,7 @@ with tab_dividends:
         if _scan_note:
             st.caption(_scan_note)
         render_ranked_table(
-            _scan_view, int(div_years), float(min_moat_div), quality_first=quality_first_div,
+            _scan_view, int(div_years), float(min_quality_div), quality_first=quality_first_div,
             download_key="div_csv", dividend_mode=True, max_payout=float(max_payout_div),
             min_div_growth=float(min_div_growth_div), min_chowder=float(min_chowder_div),
             min_market_cap_b=float(min_cap_div),

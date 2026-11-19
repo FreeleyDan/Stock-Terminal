@@ -10,11 +10,16 @@ Public entry point: evaluate_business_quality(financial_history)
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional
 
 from calculations import calculate_cagr
 
-# The Big Five Moat Metrics, in the order they're evaluated/displayed.
+# The Big Five Quality Metrics, in the order they're evaluated/displayed.
+# (Phil Town calls these the moat metrics; the app renamed the 80/10/10
+# score they feed to "Quality Score" in Nov 2026 because the number
+# measures compounding quality, not competitive position — the separate
+# Moat Score below measures that.)
 BIG_FIVE_METRICS: List[str] = [
     "ROIC",
     "Equity_Per_Share",
@@ -84,8 +89,8 @@ def _evaluate_metric_growth(
         if cagr is None:
             # e.g. sign change (negative-to-positive equity) makes CAGR
             # undefined -- treat as not yet determined rather than a hard
-            # fail, since it's a data-shape limitation, not evidence of a
-            # weak moat.
+            # fail, since it's a data-shape limitation, not evidence of
+            # weak quality.
             result[horizon] = {"cagr": None, "status": NOT_YET_DETERMINED}
             continue
 
@@ -155,24 +160,24 @@ def _evaluate_capital_allocation_test(
     return {"ratio": ratio, "status": status}
 
 
-def _compute_moat_score(
+def _compute_quality_score(
     big_five_results: Dict[str, Dict[int, Dict[str, Any]]],
     debt_test: Dict[str, Any],
     cap_alloc_test: Dict[str, Any],
 ) -> float:
     """
-    Weighted Moat Score, 0-100.
+    Weighted Quality Score, 0-100.
 
     Weighting rationale: the Big Five growth checks are the heart of the
-    "wonderful business" thesis (moat durability shown through
-    compounding), so they carry 80% of the score collectively (16% each
-    across 5 metrics), split evenly across whichever horizons actually
-    have a determined pass/fail (not-yet-determined horizons are excluded
-    from the denominator rather than counted as failures, since missing
-    history is a data limitation, not a quality signal). The Debt Test
-    and Capital Allocation Test are balance-sheet/capital-discipline
-    checks layered on top by Rule #1 -- necessary but secondary to
-    the growth-quality thesis -- so they split the remaining 20%.
+    "wonderful business" thesis (quality shown through compounding), so
+    they carry 80% of the score collectively (16% each across 5 metrics),
+    split evenly across whichever horizons actually have a determined
+    pass/fail (not-yet-determined horizons are excluded from the
+    denominator rather than counted as failures, since missing history
+    is a data limitation, not a quality signal). The Debt Test and
+    Capital Allocation Test are balance-sheet/capital-discipline checks
+    layered on top by Rule #1 -- necessary but secondary to the
+    growth-quality thesis -- so they split the remaining 20%.
     """
     metric_weight_total = 80.0
     per_metric_weight = metric_weight_total / len(BIG_FIVE_METRICS)
@@ -198,6 +203,170 @@ def _compute_moat_score(
         earned += 10.0
 
     return round(earned, 1)
+
+
+# ---------------------------------------------------------------------------
+# Moat Score (competitive position, from 10-K history only)
+# ---------------------------------------------------------------------------
+
+# A component with fewer than 3 usable observations scores 0 and is named
+# in "missing" — the UI flags it with *, the same convention as the
+# Dividend Safety Score.
+MOAT_MIN_OBSERVATIONS = 3
+MOAT_ROIC_LEVEL_CAP = 0.30  # median ROIC at/above this earns full level points
+MOAT_ROIC_PERSISTENCE_BAR = 0.15  # a horizon year counts as high-ROIC above this
+MOAT_GROSS_MARGIN_CAP = 0.60  # median gross margin at/above this earns full level points
+MOAT_REVENUE_GROWTH_STDEV_CAP = 0.30  # revenue-growth stdev at/above this earns 0 stability points
+
+
+def _median(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _stdev(values: List[float]) -> Optional[float]:
+    """Population standard deviation; None with fewer than 2 values."""
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    return math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+def _horizon_values(series: Any) -> List[float]:
+    """Numeric values from a {years_ago: value} horizon dict, oldest
+    first. Non-numeric entries are skipped."""
+    if not isinstance(series, dict):
+        return []
+    out: List[float] = []
+    for years_ago in sorted(series):
+        try:
+            out.append(float(series[years_ago]))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _margin_values(numerator: Any, denominator: Any) -> List[float]:
+    """Per-horizon margin (numerator / denominator) where both exist and
+    the denominator is positive, oldest horizon first."""
+    if not isinstance(numerator, dict) or not isinstance(denominator, dict):
+        return []
+    out: List[float] = []
+    for years_ago in sorted(denominator):
+        try:
+            den = float(denominator[years_ago])
+            num = float(numerator[years_ago])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if den > 0:
+            out.append(num / den)
+    return out
+
+
+def _annualized_growth_rates(series: Any) -> List[float]:
+    """Annualized growth between each pair of consecutive available
+    horizons (0->1, 1->3, 3->5, 5->10). Pairs where either value is
+    <= 0 are skipped — a growth rate isn't meaningful there."""
+    if not isinstance(series, dict):
+        return []
+    years = sorted(series)
+    rates: List[float] = []
+    for a, b in zip(years, years[1:]):
+        try:
+            va = float(series[a])
+            vb = float(series[b])
+        except (TypeError, ValueError):
+            continue
+        span = b - a
+        if va > 0 and vb > 0 and span > 0:
+            rates.append((va / vb) ** (1.0 / span) - 1.0)
+    return rates
+
+
+def _cv_stability(values: List[float]) -> Optional[float]:
+    """1 - coefficient of variation (stdev / median), clamped to [0, 1].
+    None when the median is not positive — stability is meaningless
+    without a positive base level."""
+    med = _median(values)
+    if med is None or med <= 0:
+        return None
+    sd = _stdev(values)
+    if sd is None:
+        return None
+    return _clamp01(1.0 - sd / med)
+
+
+def _compute_moat_score(financial_history: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Competitive-moat footprint score, 0-100, from 10-K history only.
+
+    Filings carry no market share, pricing power vs competitors, or
+    switching costs, so this is a footprint, not a Morningstar-style
+    rating: a business with a real moat tends to leave these traces,
+    and a business without one rarely fakes all four at once.
+      ROIC level (30): median ROIC over the horizon years; 30%+ is full.
+      ROIC persistence (25): share of horizon years with ROIC above 15%.
+      Gross margin (25): level 15 (median margin; 60%+ is full) +
+        stability 10 (1 - coefficient of variation, floored at 0).
+      Revenue + operating-margin stability (20): revenue stability 10
+        (1 - stdev of annualized horizon growth rates / 30%, floored
+        at 0) + operating-margin stability 10 (1 - CV of operating
+        margins, floored at 0).
+    Every component is computed from the {0,1,3,5,10}-year horizon dicts
+    data_fetcher builds; a component with fewer than 3 usable
+    observations scores 0 and is named in "missing".
+    """
+    components: Dict[str, float] = {}
+    missing: List[str] = []
+
+    roic_values = _horizon_values(financial_history.get("ROIC"))
+    if len(roic_values) >= MOAT_MIN_OBSERVATIONS:
+        med = _median(roic_values) or 0.0
+        components["roic_level"] = round(_clamp01(med / MOAT_ROIC_LEVEL_CAP) * 30.0, 1)
+        high = sum(1 for v in roic_values if v > MOAT_ROIC_PERSISTENCE_BAR)
+        components["roic_persistence"] = round(high / len(roic_values) * 25.0, 1)
+    else:
+        components["roic_level"] = 0.0
+        components["roic_persistence"] = 0.0
+        missing.append("roic")
+
+    gross_margins = _margin_values(financial_history.get("Gross_Profit"), financial_history.get("Sales"))
+    if len(gross_margins) >= MOAT_MIN_OBSERVATIONS:
+        med_gm = _median(gross_margins) or 0.0
+        level = _clamp01(med_gm / MOAT_GROSS_MARGIN_CAP) * 15.0
+        stability = _cv_stability(gross_margins)
+        components["gross_margin"] = round(level + (_clamp01(stability) * 10.0 if stability is not None else 0.0), 1)
+    else:
+        components["gross_margin"] = 0.0
+        missing.append("gross_margin")
+
+    growth_rates = _annualized_growth_rates(financial_history.get("Sales"))
+    if len(growth_rates) >= MOAT_MIN_OBSERVATIONS:
+        sd = _stdev(growth_rates) or 0.0
+        components["revenue_stability"] = round(_clamp01(1.0 - sd / MOAT_REVENUE_GROWTH_STDEV_CAP) * 10.0, 1)
+    else:
+        components["revenue_stability"] = 0.0
+        missing.append("revenue_stability")
+
+    op_margins = _margin_values(financial_history.get("Operating_Income"), financial_history.get("Sales"))
+    if len(op_margins) >= MOAT_MIN_OBSERVATIONS:
+        stability = _cv_stability(op_margins)
+        components["operating_margin_stability"] = round(_clamp01(stability) * 10.0 if stability is not None else 0.0, 1)
+    else:
+        components["operating_margin_stability"] = 0.0
+        missing.append("operating_margin_stability")
+
+    return {"score": round(sum(components.values()), 1), "components": components, "missing": missing}
 
 
 def _determine_action(
@@ -235,6 +404,8 @@ def evaluate_business_quality(financial_history: Dict[str, Any]) -> Dict[str, An
             "EPS": {...},
             "Sales": {...},
             "Free_Cash_Flow": {...},
+            "Gross_Profit": {...},       # full horizon dict (Moat Score)
+            "Operating_Income": {...},   # full horizon dict (Moat Score)
             "Long_Term_Debt": {0: ...},
             "Owner_Earnings": {0: ...},
             "Cap_Ex": {0: ...},
@@ -250,7 +421,9 @@ def evaluate_business_quality(financial_history: Dict[str, Any]) -> Dict[str, An
             "big_five": {metric: {horizon: {"cagr":..., "status":...}}},
             "debt_test": {"ratio":..., "status":...},
             "capital_allocation_test": {"ratio":..., "status":...},
-            "moat_score": float (0-100),
+            "quality_score": float (0-100; the 80/10/10 Big Five + Debt + CapEx score),
+            "moat_score": float (0-100; the competitive-moat footprint score),
+            "moat_detail": {"score":..., "components":{...}, "missing":[...]},
             "action": "UNDERVALUED_BUY" | "FAIR_VALUE_HOLD" | "OVERPRICED_AVOID",
         }
 
@@ -267,7 +440,8 @@ def evaluate_business_quality(financial_history: Dict[str, Any]) -> Dict[str, An
     debt_test = _evaluate_debt_test(financial_history)
     cap_alloc_test = _evaluate_capital_allocation_test(financial_history)
 
-    moat_score = _compute_moat_score(big_five_results, debt_test, cap_alloc_test)
+    quality_score = _compute_quality_score(big_five_results, debt_test, cap_alloc_test)
+    moat = _compute_moat_score(financial_history)
 
     action = _determine_action(
         financial_history.get("current_price"),
@@ -279,7 +453,9 @@ def evaluate_business_quality(financial_history: Dict[str, Any]) -> Dict[str, An
         "big_five": big_five_results,
         "debt_test": debt_test,
         "capital_allocation_test": cap_alloc_test,
-        "moat_score": moat_score,
+        "quality_score": quality_score,
+        "moat_score": moat["score"],
+        "moat_detail": moat,
         "action": action,
     }
 

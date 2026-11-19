@@ -564,6 +564,30 @@ def _parse_sheet_ts(value: Optional[str]) -> Optional[float]:
         return None
 
 
+def _looks_wiped(data: Any) -> bool:
+    """True when a data dict carries none of the user-entered content a
+    wipe loses: no holdings, no watchlist tickers, no notes, no manual
+    data, no sales, no signal-log entries. The dividend goal, goal
+    history and holdings baseline are deliberately NOT checked — the
+    Nov 18 wipe kept all three (they are recomputed from holdings), so
+    they cannot tell a wipe from a genuinely empty state."""
+    if not isinstance(data, dict):
+        return True
+    portfolios = data.get("portfolios") or {}
+    holdings = sum(len(v) for v in portfolios.values() if isinstance(v, list))
+    legacy = data.get("portfolio")
+    if isinstance(legacy, list):
+        holdings += len(legacy)
+    watchlists = data.get("watchlists") or {}
+    tickers = sum(len(v) for v in watchlists.values() if isinstance(v, list))
+    legacy_wl = data.get("watchlist")
+    if isinstance(legacy_wl, list):
+        tickers += len(legacy_wl)
+    return (holdings == 0 and tickers == 0
+            and not data.get("notes") and not data.get("manual")
+            and not data.get("sales_log") and not data.get("signal_log"))
+
+
 def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
     """Never raises. When Google Sheets is configured (and this is the
     default DATA_FILE path — test paths always stay local), the Sheet is
@@ -601,11 +625,20 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
         else:
             _set_backend_flag("sheets")
         return local
-    # state == "ok": last-writer-wins by saved-at timestamp.
+    # state == "ok": last-writer-wins by saved-at timestamp — except a
+    # local file that looks wiped (no holdings, watchlists, notes, manual
+    # data, sales, or signal log) never heals the Sheet: that is the
+    # Nov 18 wipe shape, and healing from it would overwrite good Sheet
+    # data with an empty state. Fall through to the Sheet-wins path
+    # instead, which also repairs the local file.
     sheet_data_clean = _clean_loaded(sheet_data)
     local_mtime = _file_mtime(path)
     sheet_ts = _parse_sheet_ts(sheet_saved_at)
-    if local_mtime is not None and sheet_ts is not None and local_mtime > sheet_ts and local != sheet_data_clean:
+    _local_wiped = _looks_wiped(local)
+    _sheet_wiped = _looks_wiped(sheet_data_clean)
+    if (local_mtime is not None and sheet_ts is not None and local_mtime > sheet_ts
+            and local != sheet_data_clean
+            and not (_local_wiped and not _sheet_wiped)):
         ws = ws or _open_worksheet(sheet_id, creds)
         if ws is not None and _sheets_write(ws, local):
             _set_backend_flag("sheets")
@@ -656,7 +689,17 @@ def _write_local_file(data: Dict[str, Any], path: str) -> bool:
 def save_user_data(data: Dict[str, Any], path: str = DATA_FILE) -> bool:
     """Save to the Sheet when configured (default path only), always keeping
     the local file as a fallback copy. A Sheet failure never loses the save
-    — it lands locally and heals the Sheet on the next load. Never raises."""
+    — it lands locally and heals the Sheet on the next load. Never raises.
+
+    Guard: a save that looks wiped (see _looks_wiped) never overwrites a
+    Sheet or local file that still holds the user's data — that is the
+    Nov 18 wipe shape, when an auto-save persisted an empty load over
+    full portfolios. The save is dropped (returns False) and the UI flag
+    is set to "sheets-guard" so the status line can say so; the next load
+    re-reads the good Sheet data. A deliberate delete-all-holdings keeps
+    the signal log (written on every Portfolio render), so it does not
+    look wiped and still saves.
+    """
     if os.path.abspath(path) != DATA_FILE:
         _set_backend_flag("local")
         return _write_local_file(data, path)
@@ -664,6 +707,21 @@ def save_user_data(data: Dict[str, Any], path: str = DATA_FILE) -> bool:
     if not sheet_id or not creds:
         _set_backend_flag("local")
         return _write_local_file(data, path)
+    if _looks_wiped(data):
+        _stored_has_content = False
+        try:
+            _sd, _sa, _state, _ws = _cached_sheets_read(sheet_id, creds)
+            _stored_has_content = _state == "ok" and _sd is not None and not _looks_wiped(_sd)
+        except Exception:
+            pass
+        if not _stored_has_content:
+            try:
+                _stored_has_content = not _looks_wiped(_load_from_file(path))
+            except Exception:
+                pass
+        if _stored_has_content:
+            _set_backend_flag("sheets-guard")
+            return False
     try:
         ws = _sheets_worksheet(sheet_id, creds)
         if _sheets_write(ws, data):

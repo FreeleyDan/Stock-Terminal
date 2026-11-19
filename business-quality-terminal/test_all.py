@@ -9,6 +9,7 @@ import threading
 import time
 
 import data_fetcher as df_mod
+import gatekeeper
 import screener
 import signals
 import storage
@@ -194,7 +195,9 @@ check("snapshot builds with no error", snap["error"], None)
 check("price comes from the price history", snap["current_price"], 100.0)
 check("EPS growth ~12%", snap["growth_rate"], 0.12, approx=0.01)
 check("historical P/E is a real median of year-end price/EPS", snap["historical_pe"] is not None and snap["historical_pe"] > 0)
-check("Moat Score computed", snap["moat_score"] > 0)
+check("Quality Score computed", snap["quality_score"] > 0)
+check("Moat Score computed (mock: debt/cash only at year 0, so ROIC has 1 horizon value; no gross/operating margin tags — only revenue stability scores)",
+      snap["moat_score"], 10.0)
 
 before = state["raw_calls"]
 valuation.build_snapshot("TEST", price_max_age=3600)
@@ -257,7 +260,7 @@ state["raw"] = (MOCK, "ok")
 
 # --------------------------------------------------------------------------
 section("valuation_from_snapshot")
-base = {"current_price": 50.0, "current_eps": 5.0, "growth_rate": 0.12, "historical_pe": 18.0, "moat_score": 70.0}
+base = {"current_price": 50.0, "current_eps": 5.0, "growth_rate": 0.12, "historical_pe": 18.0, "quality_score": 70.0}
 v1 = valuation.valuation_from_snapshot(dict(base, current_price=50.0))
 v2 = valuation.valuation_from_snapshot(dict(base, current_price=150.0))
 check("Sticker Price does NOT move with today's price", v1["sticker_price"], v2["sticker_price"])
@@ -278,36 +281,98 @@ section("Buy signals")
 gk_ok = {"debt_test": {"status": "pass"}}
 
 
-def mk(price, moat=70.0, sticker=100.0):
-    snap_ = {"current_price": price, "moat_score": moat, "gatekeeper": gk_ok}
+def mk(price, quality=70.0, sticker=100.0):
+    snap_ = {"current_price": price, "quality_score": quality, "gatekeeper": gk_ok}
     val_ = {"sticker_price": sticker, "margin_of_safety_price": sticker / 2 if sticker else None, "note": "n/a"}
     return snap_, val_
 
 
-check("BUY: at MOS + strong moat", signals.buy_signal(*mk(45.0))["signal"], "BUY")
+check("BUY: at MOS + strong quality", signals.buy_signal(*mk(45.0))["signal"], "BUY")
 check("BUY boundary: exactly at MOS", signals.buy_signal(*mk(50.0))["signal"], "BUY")
-check("CHEAP, WEAK MOAT: at MOS but moat below minimum", signals.buy_signal(*mk(45.0, moat=30.0))["signal"], "CHEAP, WEAK MOAT")
-check("NEAR BUY: 10% above MOS, good moat", signals.buy_signal(*mk(55.0))["signal"], "NEAR BUY")
+check("CHEAP, WEAK QUALITY: at MOS but quality below minimum", signals.buy_signal(*mk(45.0, quality=30.0))["signal"], "CHEAP, WEAK QUALITY")
+check("NEAR BUY: 10% above MOS, good quality", signals.buy_signal(*mk(55.0))["signal"], "NEAR BUY")
 check("WAIT: 40% above MOS", signals.buy_signal(*mk(70.0))["signal"], "WAIT")
-check("WAIT (not NEAR BUY) when near but moat weak", signals.buy_signal(*mk(55.0, moat=30.0))["signal"], "WAIT")
+check("WAIT (not NEAR BUY) when near but quality weak", signals.buy_signal(*mk(55.0, quality=30.0))["signal"], "WAIT")
 check("NO VALUATION when there's no sticker", signals.buy_signal(*mk(55.0, sticker=None))["signal"], "NO VALUATION")
-check("thresholds are adjustable", signals.buy_signal(*mk(45.0, moat=55.0), min_moat_score=50)["signal"], "BUY")
+check("thresholds are adjustable", signals.buy_signal(*mk(45.0, quality=55.0), min_moat_score=50)["signal"], "BUY")
 check("reasons always provided", len(signals.buy_signal(*mk(45.0))["reasons"]) >= 1)
+# Pre-rename snapshots carry only "moat_score" (which WAS the quality
+# score) — signals must still gate on it.
+check("old snapshot shape (moat_score only) still gates on quality",
+      signals.buy_signal({"current_price": 45.0, "moat_score": 30.0, "gatekeeper": gk_ok},
+                         {"sticker_price": 100.0, "margin_of_safety_price": 50.0, "note": "n/a"})["signal"],
+      "CHEAP, WEAK QUALITY")
+check("new snapshot shape prefers quality_score over moat_score",
+      signals.quality_score({"quality_score": 70.0, "moat_score": 20.0}), 70.0)
+check("quality_score reads 0.0 for a fund snapshot (both None)", signals.quality_score({"quality_score": None, "moat_score": None}), 0.0)
 
 # --------------------------------------------------------------------------
 section("Sell signals")
 check("SELL: price above Sticker", signals.sell_signal(*mk(120.0))["signal"], "SELL")
 check("SELL boundary: exactly at Sticker", signals.sell_signal(*mk(100.0))["signal"], "SELL")
 check("REVIEW: within 10% of Sticker", signals.sell_signal(*mk(95.0))["signal"], "REVIEW")
-check("HOLD: well below Sticker with good moat", signals.sell_signal(*mk(60.0))["signal"], "HOLD")
-check("REVIEW: weak moat even when cheap", signals.sell_signal(*mk(60.0, moat=20.0))["signal"], "REVIEW")
-check("SELL outranks REVIEW (weak moat + above sticker)", signals.sell_signal(*mk(120.0, moat=20.0))["signal"], "SELL")
+check("HOLD: well below Sticker with good quality", signals.sell_signal(*mk(60.0))["signal"], "HOLD")
+check("REVIEW: weak quality even when cheap", signals.sell_signal(*mk(60.0, quality=20.0))["signal"], "REVIEW")
+check("SELL outranks REVIEW (weak quality + above sticker)", signals.sell_signal(*mk(120.0, quality=20.0))["signal"], "SELL")
 s_dbt = mk(60.0)[0]; s_dbt["gatekeeper"] = {"debt_test": {"status": "fail"}}
 check("REVIEW: failed Debt Test", signals.sell_signal(s_dbt, mk(60.0)[1])["signal"], "REVIEW")
 check("loss limit off by default", signals.sell_signal(*mk(60.0), avg_cost=100.0)["signal"], "HOLD")
 check("REVIEW: down 40% vs cost with a 25% limit", signals.sell_signal(*mk(60.0), avg_cost=100.0, max_loss_pct=25)["signal"], "REVIEW")
 check("loss limit ignores a missing cost basis", signals.sell_signal(*mk(60.0), avg_cost=None, max_loss_pct=25)["signal"], "HOLD")
 check("REVIEW (not HOLD) when no valuation can be made", signals.sell_signal(*mk(60.0, sticker=None))["signal"], "REVIEW")
+
+# --------------------------------------------------------------------------
+section("Moat Score (competitive-moat footprint, from 10-K history)")
+
+
+def _grow_series(base, rate=0.12):
+    return {y: round(base / ((1 + rate) ** y), 2) for y in (0, 1, 3, 5, 10)}
+
+
+_sales = _grow_series(10_000_000_000)
+_perfect_hist = {
+    "ROIC": {y: 0.30 for y in (0, 1, 3, 5, 10)},
+    "Sales": _sales,
+    "Gross_Profit": {y: round(_sales[y] * 0.60, 2) for y in _sales},
+    "Operating_Income": {y: round(_sales[y] * 0.20, 2) for y in _sales},
+}
+check("perfect moat scores 100", gatekeeper._compute_moat_score(_perfect_hist)["score"], 100.0)
+check("perfect moat has no missing components", gatekeeper._compute_moat_score(_perfect_hist)["missing"], [])
+check("perfect moat components add up",
+      gatekeeper._compute_moat_score(_perfect_hist)["components"],
+      {"roic_level": 30.0, "roic_persistence": 25.0, "gross_margin": 25.0,
+       "revenue_stability": 10.0, "operating_margin_stability": 10.0})
+_weak_sales = {0: 10_000_000_000, 1: 13_000_000_000, 3: 8_000_000_000, 5: 12_000_000_000, 10: 9_000_000_000}
+_weak_hist = {
+    "ROIC": {y: 0.05 for y in (0, 1, 3, 5, 10)},
+    "Sales": _weak_sales,
+    "Gross_Profit": {y: round(_weak_sales[y] * 0.20, 2) for y in _weak_sales},
+    "Operating_Income": {y: round(_weak_sales[y] * 0.05, 2) for y in _weak_sales},
+}
+check("weak moat scores low (constant low margins still earn stability points)",
+      gatekeeper._compute_moat_score(_weak_hist)["score"], 33.2)
+check("no data scores 0 and flags every component",
+      gatekeeper._compute_moat_score({}),
+      {"score": 0.0,
+       "components": {"roic_level": 0.0, "roic_persistence": 0.0, "gross_margin": 0.0,
+                      "revenue_stability": 0.0, "operating_margin_stability": 0.0},
+       "missing": ["roic", "gross_margin", "revenue_stability", "operating_margin_stability"]})
+check("thin data (2 ROIC points) scores only the computable component",
+      gatekeeper._compute_moat_score({"ROIC": {0: 0.25, 1: 0.25}, "Sales": _sales})["score"], 10.0)
+# The full Gatekeeper return carries both scores: quality (the renamed
+# 80/10/10) and moat (the new footprint). ROIC is flat here so its Big
+# Five CAGRs fail — quality 84, moat 100.
+_full_hist = dict(_perfect_hist)
+for _m in ("Equity_Per_Share", "EPS", "Free_Cash_Flow"):
+    _full_hist[_m] = {y: 100.0 / ((1.12) ** y) for y in (0, 1, 3, 5, 10)}
+_full_hist["Long_Term_Debt"] = {0: 0.0}
+_full_hist["Owner_Earnings"] = {0: 1_000_000_000}
+_full_hist["Cap_Ex"] = {0: 100_000_000}
+_full_hist["Net_Income"] = {0: 1_000_000_000}
+_gk = gatekeeper.evaluate_business_quality(_full_hist)
+check("gatekeeper returns the renamed Quality Score", _gk["quality_score"], 84.0)
+check("gatekeeper returns the new Moat Score", _gk["moat_score"], 100.0)
+check("gatekeeper returns the moat detail", _gk["moat_detail"]["missing"], [])
 
 # --------------------------------------------------------------------------
 section("Storage")
@@ -478,6 +543,55 @@ try:
     check("sheets read cache expires after its TTL", _open_count["n"], 1)
     storage._SHEETS_READ_TTL_SECONDS = _orig_ttl
     storage._sheets_worksheet = lambda _sid, _creds: _fake
+    # Wipe guard (Nov 18): a save that looks wiped never overwrites a
+    # Sheet or local file that still holds the user's data.
+    _full = {"portfolios": {"Main": [{"ticker": "SCHD", "shares": 10.0, "avg_cost": 80.0, "drip": False}]},
+             "watchlists": {"Main": ["AAPL"]},
+             "notes": {"SCHD": {"meaning": "div"}},
+             "manual": {},
+             "sales_log": [],
+             "signal_log": [{"date": "2026-11-18", "ticker": "SCHD", "price": 80.0, "sticker": 100.0, "signal": "HOLD", "lean": ""}],
+             "dividend_income_goal": 100000.0,
+             "holdings_baseline": {"SCHD": {"shares": 10.0, "dps": 2.5, "income": 25.0, "date": "2026-11-18"}},
+             "dividend_goal_history": [{"month": "2026-11", "income": 25.0, "goal": 100000.0, "buys": 0.0, "raises": 0.0}]}
+    # The Nov 18 wiped shape: everything a wipe loses is empty, but the
+    # goal, baseline and history survive — so they must NOT save the write.
+    _wiped = dict(_full)
+    _wiped.update({"portfolios": {"Main": []}, "watchlists": {"Main": []}, "notes": {}, "signal_log": []})
+    check("wiped shape is detected", storage._looks_wiped(_wiped), True)
+    check("full shape is not wiped", storage._looks_wiped(_full), False)
+    check("delete-all-holdings (signal log kept) is not wiped",
+          storage._looks_wiped(dict(_full, portfolios={"Main": []})), False)
+    # Sheet + local both hold content -> the wiped save is refused, and
+    # neither store changes.
+    storage._sheets_write(_fake, _full)
+    with open(_sheets_tmp, "w") as f:
+        json.dump(_full, f)
+    storage._reset_sheets_read_cache()
+    _writes_before = _fake.writes
+    check("wiped save is refused when the Sheet holds data", storage.save_user_data(_wiped, _sheets_tmp), False)
+    check("refused save does not touch the Sheet", _fake.writes, _writes_before)
+    check("refused save leaves the Sheet data intact",
+          storage._sheets_read(_fake)[0]["portfolios"]["Main"][0]["ticker"], "SCHD")
+    check("refused save leaves the local file intact",
+          storage.load_user_data(_sheets_tmp)["portfolios"]["Main"][0]["ticker"], "SCHD")
+    # Nothing to protect (sheet + local both empty) -> the save is allowed.
+    _fake.rows = []
+    storage._reset_sheets_read_cache()
+    if os.path.exists(_sheets_tmp):
+        os.remove(_sheets_tmp)
+    check("wiped save is allowed when nothing is stored", storage.save_user_data(storage._empty(), _sheets_tmp), True)
+    # Heal guard: a wiped local file newer than the Sheet never heals it.
+    storage._sheets_write(_fake, _full)
+    time.sleep(0.05)
+    with open(_sheets_tmp, "w") as f:
+        json.dump(_wiped, f)
+    storage._reset_sheets_read_cache()
+    d = storage.load_user_data(_sheets_tmp)
+    check("wiped local file does not heal (overwrite) the Sheet",
+          d["portfolios"]["Main"][0]["ticker"], "SCHD")
+    check("load repairs the wiped local file from the Sheet",
+          json.load(open(_sheets_tmp))["portfolios"]["Main"][0]["ticker"], "SCHD")
 finally:
     storage._sheets_config = _orig_config
     storage._sheets_worksheet = _orig_worksheet
@@ -490,9 +604,9 @@ finally:
 section("Scanner")
 
 
-def good(t, price=50.0, streak=0, moat=70.0, eps=5.0):
+def good(t, price=50.0, streak=0, quality=70.0, eps=5.0):
     return {"ticker": t, "name": t + " Inc", "error": None, "error_kind": None, "current_price": price, "current_eps": eps,
-            "growth_rate": 0.12, "historical_pe": 18.0, "moat_score": moat, "dividend_streak": streak, "gatekeeper": gk_ok}
+            "growth_rate": 0.12, "historical_pe": 18.0, "quality_score": quality, "dividend_streak": streak, "gatekeeper": gk_ok}
 
 
 fake_db = {f"T{i}": good(f"T{i}", price=10 + i) for i in range(20)}
@@ -549,7 +663,7 @@ check("a transient failure is retried once and recovers", (len(res["snapshots"])
 
 # ranking
 snaps = [good("CHEAP", price=20.0, streak=10), good("MID", price=60.0, streak=2), good("PRICEY", price=500.0, streak=30),
-         good("NODIV", price=10.0, streak=0, moat=20.0), dict(good("LOSS"), current_eps=-1.0)]
+         good("NODIV", price=10.0, streak=0, quality=20.0), dict(good("LOSS"), current_eps=-1.0)]
 r = screener.rank_snapshots(snaps)
 order = [x["ticker"] for x in r["top_results"]]
 check("ranked most-undervalued first", order, ["NODIV", "CHEAP", "MID", "PRICEY"])
@@ -559,7 +673,7 @@ check("dividend filter keeps only >=5-year streaks", [x["ticker"] for x in r["to
 r = screener.rank_snapshots(snaps, min_dividend_years=11)
 check("a stricter slider value keeps fewer", [x["ticker"] for x in r["top_results"]], ["PRICEY"])
 r = screener.rank_snapshots(snaps, min_moat_score=50)
-check("moat filter drops weak-moat names", "NODIV" in [x["ticker"] for x in r["top_results"]], False)
+check("quality filter drops weak-quality names", "NODIV" in [x["ticker"] for x in r["top_results"]], False)
 many = [good(f"M{i}", price=10 + i) for i in range(60)]
 check("top_n limits to 25 but counts all matches", (len(screener.rank_snapshots(many)["top_results"]), screener.rank_snapshots(many)["matched_count"]), (25, 60))
 cheap_pct = screener.rank_snapshots(snaps, discount_rate=0.10)["top_results"][0]["undervalued_pct"]

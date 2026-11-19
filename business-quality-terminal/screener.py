@@ -21,6 +21,22 @@ from typing import Any, Callable, Dict, List, Optional
 from gatekeeper import BIG_FIVE_METRICS
 from valuation import TRANSIENT, build_snapshot, valuation_from_snapshot
 
+try:
+    from signals import quality_score
+except ImportError:  # deployed signals.py can lag the repo behind screener.py
+    def quality_score(snapshot: Dict[str, Any]) -> float:
+        """
+        Local copy of signals.quality_score, used only when the deployed
+        signals.py predates it — so a stale deploy can never break the
+        scanner. Same fallback rule: "quality_score" when present, else
+        the pre-rename "moat_score" (which WAS the quality score).
+        """
+        if "quality_score" in snapshot:
+            q = snapshot.get("quality_score")
+            return q if q is not None else 0.0
+        q = snapshot.get("moat_score")
+        return q if q is not None else 0.0
+
 
 def dividend_safety_score(
     payout_ratio: Optional[float],
@@ -325,7 +341,7 @@ def rank_snapshots(
 ) -> Dict[str, Any]:
     """Most undervalued first, i.e. largest (Sticker - Price) / Sticker.
 
-    Quality filters (dividend streak, moat, Big Five passes) are applied
+    Quality filters (dividend streak, quality, Big Five passes) are applied
     BEFORE sorting by price, so a cheap weak business cannot outrank a
     wonderful one on price alone. When `big_five_hurdle` is given, a row
     must pass at least `min_big_five_passes` of the Big Five at that
@@ -340,7 +356,7 @@ def rank_snapshots(
         valued += 1
         if snap.get("dividend_streak", 0) < min_dividend_years:
             continue
-        if snap.get("moat_score", 0.0) < min_moat_score:
+        if quality_score(snap) < min_moat_score:
             continue
         passes = big_five_pass_count(snap, big_five_hurdle) if big_five_hurdle is not None else big_five_pass_count(snap, 0.10)
         if big_five_hurdle is not None and passes < min_big_five_passes:
@@ -354,7 +370,11 @@ def rank_snapshots(
                 "margin_of_safety_price": val["margin_of_safety_price"],
                 "undervalued_pct": val["undervalued_pct"],
                 "growth_used": val["growth_used"],
-                "moat_score": snap.get("moat_score", 0.0),
+                "quality_score": quality_score(snap),
+                # Pre-rename snapshots carry only "moat_score" (which WAS
+                # quality) — show no Moat Score for those rather than the
+                # wrong number; the quality value is in "quality_score".
+                "moat_score": snap.get("moat_score") if "quality_score" in snap else None,
                 "action": val["action"],
                 "dividend_streak": snap.get("dividend_streak", 0),
                 "big_five_passes": passes,

@@ -6,22 +6,22 @@ and its valuation. These are mechanical screens on the model's numbers,
 not financial advice.
 
 BUY (Rule #1: a wonderful business at a margin-of-safety price):
-  BUY        price <= Margin of Safety price AND Moat Score >= minimum
+  BUY        price <= Margin of Safety price AND Quality Score >= minimum
   NEAR BUY   quality OK and price within `near_buy_pct`% above the MOS price
-  CHEAP, WEAK MOAT   price <= MOS price but Moat Score below the minimum
+  CHEAP, WEAK QUALITY   price <= MOS price but Quality Score below the minimum
   WAIT       otherwise
   NO VALUATION  no Sticker Price could be computed
 
 SELL (Rule #1: sell when price reaches fair value, or the business changes):
   SELL       price >= Sticker Price
-  REVIEW     price within `approach_pct`% below Sticker, OR Moat Score
+  REVIEW     price within `approach_pct`% below Sticker, OR Quality Score
              below `min_moat_hold`, OR the Debt Test failed, OR (optional)
              down more than `max_loss_pct`% vs your cost
   HOLD       none of the above
 
 PORTFOLIO (for something you already own — BUY means "add", not a first buy):
-  BUY        owned, price <= MOS price, Moat Score >= buy minimum, and no
-             quality REVIEW flag (low moat / failed Debt Test)
+  BUY        owned, price <= MOS price, Quality Score >= buy minimum, and no
+             quality REVIEW flag (low quality / failed Debt Test)
   NEAR BUY   owned, quality OK, price within `near_buy_pct`% above MOS price
   SELL / REVIEW / HOLD  as in SELL above
 Each signal comes with plain-English reasons.
@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 
 BUY = "BUY"
 NEAR_BUY = "NEAR BUY"
-WEAK = "CHEAP, WEAK MOAT"
+WEAK = "CHEAP, WEAK QUALITY"
 WAIT = "WAIT"
 NO_VALUATION = "NO VALUATION"
 
@@ -52,6 +52,20 @@ def _money(v: Optional[float]) -> str:
     return "\u2014" if v is None else f"${v:,.2f}"
 
 
+def quality_score(snapshot: Dict[str, Any]) -> float:
+    """The Quality Score (renamed 80/10/10 Big Five + Debt + CapEx score)
+    for a snapshot. Snapshots built before the rename carry only
+    "moat_score" — and that WAS the quality score — so fall back to it
+    only when "quality_score" is absent. (With a new snapshot,
+    "moat_score" is the separate competitive-moat footprint, never the
+    quality value.) Missing/None reads as 0.0."""
+    if "quality_score" in snapshot:
+        q = snapshot.get("quality_score")
+        return q if q is not None else 0.0
+    q = snapshot.get("moat_score")
+    return q if q is not None else 0.0
+
+
 def buy_signal(
     snapshot: Dict[str, Any],
     valuation: Dict[str, Any],
@@ -61,22 +75,22 @@ def buy_signal(
     price = snapshot.get("current_price")
     mos = valuation.get("margin_of_safety_price")
     sticker = valuation.get("sticker_price")
-    moat = snapshot.get("moat_score", 0.0)
+    quality = quality_score(snapshot)
 
     if price is None or mos is None or sticker is None:
         return {"signal": NO_VALUATION, "reasons": [valuation.get("note") or "No valuation available"], "pct_above_buy": None}
 
     pct_above = (price / mos - 1.0) * 100.0
-    quality_ok = moat >= min_moat_score
+    quality_ok = quality >= min_moat_score
     reasons: List[str] = []
 
     if price <= mos:
         reasons.append(f"Price {_money(price)} is at/below the margin-of-safety price {_money(mos)}")
         if quality_ok:
-            reasons.append(f"Moat Score {moat:g} meets the {min_moat_score:g} minimum")
+            reasons.append(f"Quality Score {quality:g} meets the {min_moat_score:g} minimum")
             signal = BUY
         else:
-            reasons.append(f"But Moat Score {moat:g} is below the {min_moat_score:g} minimum")
+            reasons.append(f"But Quality Score {quality:g} is below the {min_moat_score:g} minimum")
             signal = WEAK
     elif quality_ok and pct_above <= near_buy_pct:
         reasons.append(f"Price is {pct_above:.1f}% above the {_money(mos)} buy price (within {near_buy_pct:g}%)")
@@ -84,7 +98,7 @@ def buy_signal(
     else:
         reasons.append(f"Price is {pct_above:.1f}% above the {_money(mos)} buy price")
         if not quality_ok:
-            reasons.append(f"Moat Score {moat:g} is below the {min_moat_score:g} minimum")
+            reasons.append(f"Quality Score {quality:g} is below the {min_moat_score:g} minimum")
         signal = WAIT
     return {"signal": signal, "reasons": reasons, "pct_above_buy": pct_above}
 
@@ -99,7 +113,7 @@ def sell_signal(
 ) -> Dict[str, Any]:
     price = snapshot.get("current_price")
     sticker = valuation.get("sticker_price")
-    moat = snapshot.get("moat_score", 0.0)
+    quality = quality_score(snapshot)
     gk = snapshot.get("gatekeeper") or {}
 
     signal = HOLD
@@ -120,9 +134,9 @@ def sell_signal(
         escalate(REVIEW)
         reasons.append(f"Price is within {approach_pct:g}% of Sticker Price {_money(sticker)}")
 
-    if moat < min_moat_hold:
+    if quality < min_moat_hold:
         escalate(REVIEW)
-        reasons.append(f"Moat Score {moat:g} is below {min_moat_hold:g}")
+        reasons.append(f"Quality Score {quality:g} is below {min_moat_hold:g}")
 
     if (gk.get("debt_test") or {}).get("status") == "fail":
         escalate(REVIEW)
@@ -152,7 +166,7 @@ def portfolio_signal(
     """BUY / NEAR BUY / HOLD / REVIEW / SELL for a holding you already own.
 
     Priority, in order: SELL (fair value reached) > REVIEW for a quality
-    problem (low moat or failed Debt Test — never add to a deteriorating
+    problem (low quality or failed Debt Test — never add to a deteriorating
     business just because it is cheap) > BUY / NEAR BUY (wonderful business
     at or near its MOS price) > REVIEW for price approaching Sticker or
     for a loss vs cost beyond the limit > HOLD.
@@ -165,7 +179,7 @@ def portfolio_signal(
     signal, because REVIEW alone does not say which way to lean:
       SELL signal / quality REVIEW -> lean SELL (fair value reached,
         or the business itself changed — the Rule #1 sell trigger)
-      WEAK REVIEW (cheap but moat too weak to add) -> lean KEEP
+      WEAK REVIEW (cheap but quality too weak to add) -> lean KEEP
         (hold, do not add)
       approaching-Sticker REVIEW -> lean KEEP (hold until Sticker,
         then sell)
@@ -179,10 +193,10 @@ def portfolio_signal(
     price = snapshot.get("current_price")
     sticker = valuation.get("sticker_price")
     mos = valuation.get("margin_of_safety_price")
-    moat = snapshot.get("moat_score", 0.0)
+    quality = quality_score(snapshot)
     gk = snapshot.get("gatekeeper") or {}
     debt_failed = (gk.get("debt_test") or {}).get("status") == "fail"
-    quality_review = moat < min_moat_hold or debt_failed
+    quality_review = quality < min_moat_hold or debt_failed
 
     if price is None or sticker is None or mos is None:
         sell = sell_signal(snapshot, valuation, avg_cost, approach_pct, min_moat_hold, max_loss_pct)
@@ -198,8 +212,8 @@ def portfolio_signal(
 
     if quality_review:
         reasons = []
-        if moat < min_moat_hold:
-            reasons.append(f"Moat Score {moat:g} is below {min_moat_hold:g} — do not add")
+        if quality < min_moat_hold:
+            reasons.append(f"Quality Score {quality:g} is below {min_moat_hold:g} — do not add")
         if debt_failed:
             reasons.append("Debt Test failed (long-term debt > 3x owner earnings) — do not add")
         return {"signal": REVIEW, "reasons": reasons, "lean": "SELL",
@@ -213,7 +227,7 @@ def portfolio_signal(
         return {"signal": NEAR_BUY, "reasons": ["Owned holding — near-add signal:"] + buy["reasons"],
                 "lean": "KEEP", "lean_note": "Close to its buy price — hold until it reaches it"}
     if buy["signal"] == WEAK:
-        return {"signal": REVIEW, "reasons": buy["reasons"] + ["Do not add — moat is too weak"],
+        return {"signal": REVIEW, "reasons": buy["reasons"] + ["Do not add — quality is too weak"],
                 "lean": "KEEP", "lean_note": "Cheap but too weak to add — hold, do not add"}
 
     reasons: List[str] = []

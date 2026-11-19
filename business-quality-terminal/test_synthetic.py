@@ -242,7 +242,7 @@ def main():
         errors.append("FAIL: single payment -> that payment")
 
     # Fund snapshot: SEC has no 10-K (not_covered) -> Yahoo-only snapshot
-    # with price and TTM distributions, no Sticker/Moat. Stubbed Yahoo.
+    # with price and TTM distributions, no Sticker/Quality Score. Stubbed Yahoo.
     import valuation as _val_mod
     _real_facts = _val_mod.fetch_raw_companyfacts
     _real_prices = _val_mod.get_price_history
@@ -273,7 +273,8 @@ def main():
     if "Fund" not in (_fund_val.get("note") or ""):
         errors.append(f"FAIL: fund valuation note got {_fund_val.get('note')}")
 
-    print(f"Moat Score: {gatekeeper_result['moat_score']} / 100")
+    print(f"Quality Score: {gatekeeper_result['quality_score']} / 100")
+    print(f"Moat Score: {gatekeeper_result['moat_score']} / 100 (mock has no gross/operating margin, so those parts are 0)")
     if errors:
         print(f"{len(errors)} FAILURE(S):")
         for e in errors:
