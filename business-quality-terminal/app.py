@@ -505,6 +505,13 @@ def _storage_status_line(last_saved: Optional[str] = None) -> str:
     "Saved ..." sentence; without one, the short form for the Dashboard."""
     _backend = st.session_state.get("storage_backend", "local")
     if _backend == "sheets":
+        _restored = st.session_state.get("storage_restored_from")
+        if _restored:
+            if last_saved:
+                return (f"Saved to Google Sheets: {last_saved}. Restored from a backup "
+                        f"({str(_restored)[:16]}) after the live copy came up empty. Check your portfolios.")
+            return (f"Saved to Google Sheets. Survives restarts. Restored from a backup "
+                    f"({str(_restored)[:16]}) after the live copy came up empty. Check your portfolios.")
         if last_saved:
             return f"Saved to Google Sheets: {last_saved}. Survives restarts."
         return "Saved to Google Sheets — survives restarts."
@@ -1487,6 +1494,12 @@ with tab_dashboard:
         "presets. " + _storage_status_line() + " "
         "Prices already refresh on their own when older than 15 minutes — the button forces fresh prices now."
     )
+    if st.session_state.get("storage_backend") == "sheets-unavailable":
+        st.error(
+            "Google Sheets is unreachable. Your changes are saving only on this server right now, "
+            "and a restart could wipe them. Download a full backup (JSON) above. "
+            "The app syncs automatically once Sheets is back."
+        )
     _dash_portfolios = _dash_data.get("portfolios") or {}
     _dash_watchlists = _dash_data.get("watchlists") or {}
     _dash_cash = _dash_data.get("portfolio_cash") or {}

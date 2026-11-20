@@ -437,6 +437,7 @@ class _FakeSheet:
     def __init__(self):
         self.rows = []
         self.writes = 0
+        self.spreadsheet = None
 
     def get_all_values(self):
         return [list(r) for r in self.rows]
@@ -448,8 +449,36 @@ class _FakeSheet:
         self.rows = [list(r) for r in values]
         self.writes += 1
 
+    def append_rows(self, values, value_input_option="RAW"):
+        self.rows.extend([list(r) for r in values])
+        self.writes += 1
+
+    def delete_rows(self, start, end):
+        # 1-based inclusive, like gspread.
+        del self.rows[start - 1:end]
+
+
+class _FakeBook:
+    """In-memory stand-in for a gspread Spreadsheet."""
+    def __init__(self):
+        self.sheets = {}
+
+    def worksheet(self, title):
+        if title not in self.sheets:
+            raise Exception("WorksheetNotFound: " + title)
+        return self.sheets[title]
+
+    def add_worksheet(self, title, rows=1000, cols=2):
+        ws = _FakeSheet()
+        ws.spreadsheet = self
+        self.sheets[title] = ws
+        return ws
+
 
 _fake = _FakeSheet()
+_fake_book = _FakeBook()
+_fake_book.sheets["data"] = _fake
+_fake.spreadsheet = _fake_book
 _orig_config = storage._sheets_config
 _orig_worksheet = storage._sheets_worksheet
 _orig_data_file = storage.DATA_FILE
@@ -593,6 +622,103 @@ try:
           d["portfolios"]["Main"][0]["ticker"], "SCHD")
     check("load repairs the wiped local file from the Sheet",
           json.load(open(_sheets_tmp))["portfolios"]["Main"][0]["ticker"], "SCHD")
+    # Versioned backups (Nov 19): a changed state is stamped into a
+    # "backups" worksheet; unchanged states and the 15-minute throttle
+    # write nothing; old blocks are pruned; a guard-refused save writes
+    # no backup; and a wiped live sheet + wiped local file restores the
+    # newest backup instead of returning an empty state. Earlier tests
+    # above already saved (and backed up) other states, so start clean.
+    if "backups" in _fake_book.sheets:
+        del _fake_book.sheets["backups"]
+    check("no backups worksheet before the first backup", _fake_book.sheets.get("backups"), None)
+    storage._LAST_BACKUP_HASH = None
+    storage._LAST_BACKUP_AT = 0.0
+    storage._LAST_BACKUP_COUNT = 0
+    storage._reset_sheets_read_cache()
+    _fake.rows = []
+    storage._sheets_write(_fake, _full)
+    if os.path.exists(_sheets_tmp):
+        os.remove(_sheets_tmp)
+    storage.save_user_data(_full, _sheets_tmp)
+    _backups = _fake_book.sheets.get("backups")
+    check("first changed save writes one backup block",
+          len(storage._read_backups(_backups)) if _backups is not None else -1, 1)
+    check("backup block holds the saved portfolios",
+          storage._read_backups(_backups)[0]["data"]["portfolios"]["Main"][0]["ticker"], "SCHD")
+    storage.save_user_data(_full, _sheets_tmp)
+    check("unchanged state writes no second backup", len(storage._read_backups(_backups)), 1)
+    _changed = dict(_full)
+    _changed["portfolios"] = {"Main": [{"ticker": "VOO", "shares": 5.0, "avg_cost": 500.0, "drip": False}]}
+    storage.save_user_data(_changed, _sheets_tmp)
+    check("changed state inside the throttle window writes no backup", len(storage._read_backups(_backups)), 1)
+    storage._LAST_BACKUP_AT = time.time() - 3600
+    storage.save_user_data(_changed, _sheets_tmp)
+    check("changed state after the throttle window writes a backup", len(storage._read_backups(_backups)), 2)
+    # Guard-refused save writes no backup.
+    _before = len(storage._read_backups(_backups))
+    check("wiped save is still refused with backups present", storage.save_user_data(_wiped, _sheets_tmp), False)
+    check("refused save writes no backup", len(storage._read_backups(_backups)), _before)
+    # Prune (direct): 12 blocks with a keep limit of 3 leaves the newest 3.
+    if "backups" in _fake_book.sheets:
+        del _fake_book.sheets["backups"]
+    _bws = storage._backups_worksheet("fake-sheet-id", {"type": "service_account"})
+    for _i in range(12):
+        storage._write_backup(_bws, {"portfolios": {"Main": [{"ticker": "P%d" % _i, "shares": 1.0, "avg_cost": 1.0, "drip": False}]}}, "2026-11-19T%02d:00:00+00:00" % _i)
+    _kept = storage._read_backups(_bws)
+    check("twelve backup blocks parse back", len(_kept), 12)
+    _orig_keep = storage.BACKUP_KEEP
+    storage.BACKUP_KEEP = 3
+    storage._prune_backups(_bws, _kept)
+    _kept = storage._read_backups(_bws)
+    check("prune keeps only the newest BACKUP_KEEP backups", len(_kept), 3)
+    check("prune keeps the newest backup, not the oldest",
+          _kept[-1]["data"]["portfolios"]["Main"][0]["ticker"], "P11")
+    storage.BACKUP_KEEP = _orig_keep
+    # Auto-restore: live sheet empty + local empty + backup exists.
+    _fake.rows = []
+    storage._reset_sheets_read_cache()
+    storage._LAST_BACKUP_HASH = None
+    storage._LAST_BACKUP_AT = 0.0
+    storage._LAST_BACKUP_COUNT = 0
+    if os.path.exists(_sheets_tmp):
+        os.remove(_sheets_tmp)
+    d = storage.load_user_data(_sheets_tmp)
+    check("empty sheet + empty local restores the newest backup",
+          d["portfolios"]["Main"][0]["ticker"], "P11")
+    check("restore writes the backup back into the live sheet",
+          storage._sheets_read(_fake)[0]["portfolios"]["Main"][0]["ticker"], "P11")
+    # Fresh install: no backups at all -> empty state, nothing restored.
+    del _fake_book.sheets["backups"]
+    _fake.rows = []
+    storage._reset_sheets_read_cache()
+    storage._LAST_BACKUP_HASH = None
+    if os.path.exists(_sheets_tmp):
+        os.remove(_sheets_tmp)
+    d = storage.load_user_data(_sheets_tmp)
+    check("fresh install with no backups returns an empty state", d, storage._empty())
+    # Both-wiped live state + a backup -> restore.
+    storage._sheets_write(_fake, _full)
+    storage._LAST_BACKUP_HASH = None
+    storage._LAST_BACKUP_AT = 0.0
+    storage._LAST_BACKUP_COUNT = 0
+    storage.save_user_data(_full, _sheets_tmp)  # writes a backup of _full
+    storage._sheets_write(_fake, _wiped)  # simulate the wiped live sheet
+    with open(_sheets_tmp, "w") as f:
+        json.dump(_wiped, f)
+    storage._reset_sheets_read_cache()
+    d = storage.load_user_data(_sheets_tmp)
+    check("wiped sheet + wiped local restores the newest backup",
+          d["portfolios"]["Main"][0]["ticker"], "SCHD")
+    # Sheet empty + local full -> migrate, backup untouched.
+    _nb_before = len(storage._read_backups(_fake_book.sheets["backups"]))
+    _fake.rows = []
+    storage._reset_sheets_read_cache()
+    with open(_sheets_tmp, "w") as f:
+        json.dump(_full, f)
+    d = storage.load_user_data(_sheets_tmp)
+    check("empty sheet + full local migrates the local data",
+          d["portfolios"]["Main"][0]["ticker"], "SCHD")
+    check("migration writes no backup", len(storage._read_backups(_fake_book.sheets["backups"])), _nb_before)
 finally:
     storage._sheets_config = _orig_config
     storage._sheets_worksheet = _orig_worksheet

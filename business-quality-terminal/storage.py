@@ -24,6 +24,7 @@ carry integer-keyed gatekeeper dicts that JSON would turn into strings.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import pickle
@@ -356,8 +357,27 @@ SHEETS_MARKER = "STOCK-TERMINAL-DATA"
 SHEETS_CHUNK_CHARS = 40000  # Sheets cells cap at 50,000 chars
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# Versioned backups (Nov 19, 2026): every changed state is also stamped
+# into a "backups" worksheet in the same spreadsheet — one block per
+# backup (header row + JSON chunks, same 40k chunking as the live sheet).
+# A backup never overwrites the live data; the newest backup is only
+# restored automatically when BOTH the live sheet and the local file come
+# up empty/wiped (see load_user_data). BACKUP_KEEP hourly backups is
+# ~3 days; the nightly Drive copy covers anything older.
+SHEETS_BACKUPS_WORKSHEET = "backups"
+BACKUP_MARKER = "STOCK-TERMINAL-BACKUP"
+BACKUP_KEEP = 72
+BACKUP_MIN_SECONDS = 15 * 60  # at most one backup per 15 min while the state keeps changing
+
 _SHEETS_CONFIG: Optional[Tuple[Optional[str], Optional[Dict[str, Any]]]] = None
 _LAST_SHEETS_SAVED_AT: Optional[str] = None
+
+# Backup bookkeeping, per process: the hash/time/count of the last backup
+# written (or learned from the sheet on first use after a restart), so a
+# save only writes a backup when the state actually changed.
+_LAST_BACKUP_HASH: Optional[str] = None
+_LAST_BACKUP_AT: float = 0.0  # wall-clock seconds, from the backup's saved_at
+_LAST_BACKUP_COUNT: int = 0
 
 # One cached sheet read serves every load_user_data() call for a minute.
 # The app calls load_user_data() dozens of times per Streamlit rerun —
@@ -433,6 +453,20 @@ def _set_backend_flag(value: str) -> None:
     try:
         import streamlit as st
         st.session_state["storage_backend"] = value
+    except Exception:
+        pass
+
+
+def _set_restore_note(saved_at: Optional[str]) -> None:
+    """Remember (for this session only) that the live data was restored
+    from a backup, so the UI can say so. No-op outside Streamlit. The
+    backend flag itself stays "sheets" — an older app.py ignores this
+    extra session key entirely, so a stale deploy can never show a wrong
+    storage message because of it."""
+    try:
+        import streamlit as st
+        if saved_at:
+            st.session_state["storage_restored_from"] = saved_at
     except Exception:
         pass
 
@@ -529,6 +563,162 @@ def _sheets_write(worksheet, data: Dict[str, Any]) -> bool:
         return False
 
 
+def _backup_hash(data: Dict[str, Any]) -> str:
+    """Stable fingerprint of a state dict, for 'did anything change?'."""
+    try:
+        return hashlib.sha256(json.dumps(data, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+def _backups_worksheet(sheet_id: str, creds: Dict[str, Any]):
+    """Open (creating if needed) the 'backups' worksheet. Raises on failure."""
+    ws = _sheets_worksheet(sheet_id, creds)
+    book = ws.spreadsheet
+    try:
+        return book.worksheet(SHEETS_BACKUPS_WORKSHEET)
+    except Exception:
+        return book.add_worksheet(SHEETS_BACKUPS_WORKSHEET, rows=1000, cols=2)
+
+
+def _read_backups(ws) -> List[Dict[str, Any]]:
+    """Parse the backups worksheet into [{saved_at, sha, data, start_row}],
+    oldest first. Unparseable blocks are skipped, never fatal."""
+    out: List[Dict[str, Any]] = []
+    try:
+        rows = ws.get_all_values()
+    except Exception:
+        return out
+    i = 0
+    while i < len(rows):
+        r = rows[i] or []
+        if r and r[0] == BACKUP_MARKER:
+            saved_at = r[1] if len(r) > 1 else None
+            try:
+                count = int(r[2]) if len(r) > 2 else 0
+            except (TypeError, ValueError):
+                count = 0
+            sha = r[3] if len(r) > 3 else ""
+            chunks = []
+            for cr in rows[i + 1:i + 1 + count]:
+                if cr:
+                    chunks.append(cr[0])
+            try:
+                data = json.loads("".join(chunks))
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                out.append({"saved_at": saved_at, "sha": sha, "data": data, "start_row": i + 1})
+            i += 1 + max(count, 0)
+        else:
+            i += 1
+    return out
+
+
+def _write_backup(ws, data: Dict[str, Any], saved_at: str) -> bool:
+    """Append one backup block (header + chunks). Never raises."""
+    try:
+        text = json.dumps(data, separators=(",", ":"))
+        chunks = _sheets_split(text)
+        sha = _backup_hash(data)
+        values = [[BACKUP_MARKER, saved_at, str(len(chunks)), sha]] + [[c] for c in chunks]
+        ws.append_rows(values, value_input_option="RAW")
+        return True
+    except Exception:
+        return False
+
+
+def _prune_backups(ws, backups: List[Dict[str, Any]]) -> None:
+    """Drop the oldest backup blocks once the count is well over
+    BACKUP_KEEP, keeping the newest BACKUP_KEEP. One delete_rows call on
+    the leading rows — never a clear+rewrite, so a failed prune can't
+    take the kept backups with it. Never raises."""
+    if len(backups) <= BACKUP_KEEP + 8:
+        return
+    keep = backups[-BACKUP_KEEP:]
+    first_kept_row = keep[0].get("start_row") or 1
+    if first_kept_row <= 1:
+        return
+    try:
+        ws.delete_rows(1, first_kept_row - 1)
+    except Exception:
+        pass
+
+
+def _maybe_backup(sheet_id: str, creds: Dict[str, Any], data: Dict[str, Any]) -> None:
+    """Write a versioned backup when the state changed since the last one
+    (and at least BACKUP_MIN_SECONDS passed). Best-effort: never raises,
+    never breaks the save that just succeeded. Callers only invoke it on
+    the Sheet path, after a successful live write — a guard-refused save
+    never reaches here, so a refused save writes no backup."""
+    global _LAST_BACKUP_HASH, _LAST_BACKUP_AT, _LAST_BACKUP_COUNT
+    try:
+        sha = _backup_hash(data)
+        if not sha:
+            return
+        if _looks_wiped(data):
+            # A backup of an empty state can never restore anything, and
+            # as the newest block it could shadow a real backup. Fresh
+            # installs (the only saves that look wiped) write no backup.
+            return
+        if _LAST_BACKUP_HASH is None:
+            # First backup check in this process: learn the last backup
+            # from the sheet so a restart doesn't re-backup unchanged data.
+            try:
+                prior = _read_backups(_backups_worksheet(sheet_id, creds))
+                if prior:
+                    _LAST_BACKUP_HASH = prior[-1].get("sha") or ""
+                    _LAST_BACKUP_COUNT = len(prior)
+                    try:
+                        _LAST_BACKUP_AT = datetime.fromisoformat(prior[-1].get("saved_at")).timestamp()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        if sha == _LAST_BACKUP_HASH:
+            return
+        if _LAST_BACKUP_HASH and time.time() - _LAST_BACKUP_AT < BACKUP_MIN_SECONDS:
+            return
+        ws = _backups_worksheet(sheet_id, creds)
+        saved_at = datetime.now(timezone.utc).isoformat()
+        if _write_backup(ws, data, saved_at):
+            _LAST_BACKUP_HASH = sha
+            _LAST_BACKUP_AT = time.time()
+            _LAST_BACKUP_COUNT += 1
+            if _LAST_BACKUP_COUNT > BACKUP_KEEP + 8:
+                try:
+                    _prune_backups(ws, _read_backups(ws))
+                    _LAST_BACKUP_COUNT = BACKUP_KEEP
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _restore_newest_backup(sheet_id: str, creds: Dict[str, Any]):
+    """Write the newest parseable backup into the live 'data' worksheet
+    and return (data, saved_at). Returns (None, None) when there is no
+    usable backup. Never raises."""
+    global _LAST_SHEETS_SAVED_AT, _LAST_BACKUP_HASH
+    try:
+        backups = _read_backups(_backups_worksheet(sheet_id, creds))
+        if not backups:
+            return None, None
+        newest = backups[-1]
+        data = newest["data"]
+        saved_at = newest.get("saved_at")
+        live = _open_worksheet(sheet_id, creds)
+        if live is None:
+            return None, None
+        if _sheets_write(live, data):
+            _LAST_SHEETS_SAVED_AT = saved_at
+            _LAST_BACKUP_HASH = newest.get("sha") or ""
+            return data, saved_at
+        return None, None
+    except Exception:
+        return None, None
+
+
 def _load_from_file(path: str) -> Dict[str, Any]:
     """Read + clean the local JSON file. Never raises; a corrupt file is
     moved aside (.corrupt) and replaced by an empty one."""
@@ -623,6 +813,20 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
             else:
                 _set_backend_flag("sheets-unavailable")
         else:
+            # Live sheet empty AND local cache empty. A fresh install looks
+            # exactly the same — but a fresh install has no backups, so the
+            # restore below is a no-op there. If backups exist, the live
+            # state was lost; recover the newest one instead of starting
+            # from nothing.
+            restored, restored_at = _restore_newest_backup(sheet_id, creds)
+            if restored is not None:
+                _set_backend_flag("sheets")
+                _set_restore_note(restored_at)
+                try:
+                    _write_local_file(_clean_loaded(restored), path)
+                except Exception:
+                    pass
+                return _clean_loaded(restored)
             _set_backend_flag("sheets")
         return local
     # state == "ok": last-writer-wins by saved-at timestamp — except a
@@ -636,6 +840,21 @@ def load_user_data(path: str = DATA_FILE) -> Dict[str, Any]:
     sheet_ts = _parse_sheet_ts(sheet_saved_at)
     _local_wiped = _looks_wiped(local)
     _sheet_wiped = _looks_wiped(sheet_data_clean)
+    if _sheet_wiped and _local_wiped:
+        # Both stores look wiped — the Nov 18 shape, but after the guard
+        # this can only come from damage outside the app. Recover the
+        # newest versioned backup instead of returning an empty state.
+        restored, restored_at = _restore_newest_backup(sheet_id, creds)
+        if restored is not None:
+            _set_backend_flag("sheets")
+            _set_restore_note(restored_at)
+            try:
+                _write_local_file(_clean_loaded(restored), path)
+            except Exception:
+                pass
+            return _clean_loaded(restored)
+        # No backup to restore: fall through to the Sheet-wins path below,
+        # which returns the (empty) Sheet data without overwriting anything.
     if (local_mtime is not None and sheet_ts is not None and local_mtime > sheet_ts
             and local != sheet_data_clean
             and not (_local_wiped and not _sheet_wiped)):
@@ -730,6 +949,7 @@ def save_user_data(data: Dict[str, Any], path: str = DATA_FILE) -> bool:
                 _write_local_file(data, path)
             except Exception:
                 pass
+            _maybe_backup(sheet_id, creds, data)
             return True
     except Exception:
         pass
