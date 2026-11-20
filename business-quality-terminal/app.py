@@ -1028,7 +1028,7 @@ def _add_to_portfolio_controls(tickers: List[str], key_suffix: str) -> None:
             elif result == "already":
                 st.warning(f"{pick_ticker} is already in '{pick_pf}'.")
             else:
-                st.warning("Couldn't write user_data.json — changes won't persist after a restart.")
+                st.warning("Couldn't save — your change didn't stick. Try again, and download a backup if it keeps failing.")
 
 
 def _pct_or_dash(v: Any) -> str:
@@ -1052,7 +1052,7 @@ def _card_add_controls(ticker: str) -> None:
             elif card_pf_result == "already":
                 st.warning(f"{ticker} is already in '{pick_pf_card}'.")
             else:
-                st.warning("Couldn't write user_data.json — changes won't persist after a restart.")
+                st.warning("Couldn't save — your change didn't stick. Try again, and download a backup if it keeps failing.")
     with card_c2:
         wl_names_card = list((load_user_data().get("watchlists") or {"Main": []}).keys()) or ["Main"]
         pick_wl_card = st.selectbox("Watchlist", wl_names_card, key=f"card_wl_{ticker}")
@@ -1063,7 +1063,7 @@ def _card_add_controls(ticker: str) -> None:
             elif card_wl_result == "already":
                 st.warning(f"{ticker} is already in watchlist '{pick_wl_card}'.")
             else:
-                st.warning("Couldn't write user_data.json — changes won't persist after a restart.")
+                st.warning("Couldn't save — your change didn't stick. Try again, and download a backup if it keeps failing.")
 
 
 def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str, Any]], max_growth: float, discount_rate: float = 0.15) -> None:
@@ -1304,7 +1304,7 @@ def render_ticker_card(ticker: str, snap: Dict[str, Any], val: Optional[Dict[str
             if save_note(ticker, {"meaning": meaning, "management": management, "moat_type": moat_type, "thesis": thesis, "sell_trigger": sell_trigger}):
                 st.success(f"Notes saved for {ticker}.")
             else:
-                st.warning("Couldn't save notes — they won't persist after a restart on Cloud. Use the Portfolio export as a backup.")
+                st.warning("Couldn't save notes — your change didn't stick. Try again, and download a backup if it keeps failing.")
 
     # Cross-checks — eye check only. Nothing here changes the main
     # Sticker Price, MOS, Top 25 ranking, or any BUY/SELL signal.
@@ -1844,8 +1844,7 @@ with tab_portfolio:
     st.caption(
         "Add your holdings (shares and average cost are optional but give you gain/loss). "
         "Signals are BUY (add to a holding) / NEAR BUY / HOLD / REVIEW / SELL. "
-        "Changes save automatically to user_data.json — on Streamlit Cloud that file "
-        "can be wiped on sleep/restart, so use the export below for anything you want to keep. " + DISCLAIMER
+        "Changes save automatically to Google Sheets — they survive restarts. The export below is an extra copy you can keep. " + DISCLAIMER
     )
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -1982,7 +1981,7 @@ with tab_portfolio:
         if save_portfolio(holdings, name=pf_name):
             st.session_state[pf_saved_key] = holdings
         else:
-            st.warning("Couldn't write user_data.json \u2014 changes won't persist after a restart.")
+            st.warning("Couldn't save — your change didn't stick. Try again, and download a backup if it keeps failing.")
 
     if not holdings:
         st.info("Add a ticker above to see its buy/hold/sell signal.")
@@ -2469,7 +2468,7 @@ with tab_portfolio:
             mime="application/json",
             key="pf_export_btn",
         )
-        st.caption("Keep this file as your backup — on Streamlit Cloud the saved file can be wiped on sleep/restart.")
+        st.caption("Keep this file as an extra backup — your data also lives in Google Sheets, with versioned backups and a nightly Drive copy.")
 
 
 # --- 3. Watchlist ---------------------------------------------------------
@@ -2541,7 +2540,7 @@ with tab_watchlist:
         if save_watchlist(watch, name=wl_name):
             st.session_state[wl_saved_key] = watch
         else:
-            st.warning("Couldn't write user_data.json \u2014 changes won't persist after a restart.")
+            st.warning("Couldn't save — your change didn't stick. Try again, and download a backup if it keeps failing.")
 
     if not watch:
         st.info("Add a ticker above to see its buy signal.")
